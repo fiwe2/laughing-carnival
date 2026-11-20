@@ -1,0 +1,303 @@
+import { submitBtn } from '@ext/lib/buttons';
+import { geist } from '@ext/lib/geist';
+import { useCopyToClipboard } from '@ext/lib/useCopy';
+import { displayHost, shareUrl } from '@marklayer/brand/links';
+import { cn } from '@marklayer/ui/cn';
+import { useSignal } from '@preact/signals';
+import { Link2, Settings2, Trash2 } from 'lucide-preact';
+import { DAY_SECONDS, deletionDeadline, type OwnedLink } from '../../shared/accounts';
+import { CopyControl } from '../shared';
+import { APP_MEASURE } from './AppBar';
+import { FolderBar, FolderDialog, inFilter, MoveMenu } from './Folders';
+import { LinkSettings } from './LinkSettings';
+import { folderFilter, links, linksLoading, releaseLink, user } from './session';
+
+/** Where the expiry stops being background information and starts being news. */
+const SOON_DAYS = 7;
+/** And where it stops being news and becomes the last thing you can do about it. */
+const LAST_CALL_DAYS = 1;
+
+/**
+ * Emphasis by tone, not by colour. A saturated red on every link inside a week
+ * makes the loudest thing on the page the one that is still fine; red is held
+ * back for the day the link actually goes.
+ */
+function expiryTone(days: number | null): string {
+  if (days === null) return '';
+  if (days <= LAST_CALL_DAYS) return 'font-medium text-(--ds-red-700)';
+  if (days <= SOON_DAYS) return 'font-medium text-(--ds-gray-1000)';
+  return '';
+}
+
+/**
+ * Days until the retention cron takes it, or null when nothing is going to. Every
+ * row here is claimed by definition — `listAnnotations` selects on `owner_id` —
+ * so `owned` is the constant that makes the idle window not apply.
+ */
+function daysLeft(link: OwnedLink): number | null {
+  const deadline = deletionDeadline({ ...link, owned: true });
+  return deadline === null ? null : Math.max(0, Math.ceil((deadline - Date.now() / 1000) / DAY_SECONDS));
+}
+
+/** The end of the row's meta line: a countdown, or that there is no countdown. */
+function expiryText(days: number | null): string {
+  if (days === null) return 'No expiry';
+  if (days === 0) return 'Expires today';
+  return `Expires in ${days} ${days === 1 ? 'day' : 'days'}`;
+}
+
+function whenText(seconds: number): string {
+  const days = Math.floor((Date.now() / 1000 - seconds) / DAY_SECONDS);
+  if (days < 1) return 'today';
+  if (days === 1) return 'yesterday';
+  if (days < 30) return `${days} days ago`;
+  return new Date(seconds * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function hostOf(url: string | null): string {
+  if (!url) return 'Untitled';
+  return displayHost(url) ?? url;
+}
+
+/** The rest of the address. Two links into the same site are otherwise one row twice. */
+function pathOf(url: string | null): string {
+  if (!url) return '';
+  try {
+    const { pathname, search } = new URL(url);
+    const rest = `${pathname}${search}`;
+    return rest === '/' ? '' : rest;
+  } catch {
+    return '';
+  }
+}
+
+/** The card the whole page is built from — one hairline, one radius, no shadow. */
+const PANEL = 'rounded-xl border border-(--ds-gray-alpha-400) bg-(--ds-background-100)';
+
+/**
+ * `geist.actionBtn` pulls 6px off both sides so a lone action lines up with the
+ * content above it. In a right-aligned pair that eats the gap between the two
+ * labels, so the inner margins are cancelled and only the outer edge keeps one.
+ */
+const CONFIRM_BTN = 'mx-0 text-(--ds-red-700) hover:bg-(--ds-gray-alpha-100)';
+const CONFIRM_LAST = 'mx-0 -mr-1.5';
+
+/** 44px on touch, back to the 28px row control from `sm` up. Mirrors `shared.tsx`. */
+const ROW_CTL = 'size-11 sm:size-7';
+
+/** Copy, and say so: the flash is the confirmation, and a failed write toasts instead. */
+function CopyButton({ id }: { id: string }) {
+  const { copied, copy } = useCopyToClipboard({ resetMs: 1600 });
+  return (
+    <CopyControl
+      copied={copied.value}
+      onClick={() => copy(shareUrl({ origin: location.origin, kind: 'page', id, ref: 'dash' }))}
+      size={14}
+      strokeWidth={1.5}
+      class={cn(geist.ctlSm, ROW_CTL)}
+    />
+  );
+}
+
+function LinkRow({ link }: { link: OwnedLink }) {
+  // One signal, not two booleans — the states were already mutually exclusive
+  // by convention; this makes it structural.
+  const mode = useSignal<'idle' | 'confirming' | 'settings'>('idle');
+  const left = daysLeft(link);
+  const path = pathOf(link.url);
+  return (
+    <li class="px-4 py-3.5 transition-colors duration-150 hover:bg-(--ds-gray-alpha-100)">
+      {/* `group` sits on the title row, not the <li>: hovering a toggle in the
+          settings panel below should not underline the link above it. */}
+      <div class="group relative flex items-center gap-3">
+        <div class="min-w-0 flex-1">
+          {/* The stretched pseudo-element makes the whole row the link, which is
+              why the actions beside it are positioned: later in the DOM and also
+              positioned, so they stack above the overlay without a z-index. */}
+          <a
+            href={`/s/${link.id}`}
+            class="text-ui tracking-ui block truncate font-medium text-(--ds-gray-1000) no-underline after:absolute after:inset-0 group-hover:underline"
+          >
+            {hostOf(link.url)}
+            {path ? <span class="font-normal text-(--ds-gray-900)">{path}</span> : null}
+          </a>
+          {/* Wraps on a narrow screen rather than truncating: the row already
+              gives the title the ellipsis, and an expiry cut to "in 89 da…" is
+              the one number on the line worth reading. */}
+          <p class="text-meta mt-1 text-(--ds-gray-900) sm:truncate">
+            <span class="tabular-nums whitespace-nowrap">Opened {whenText(link.lastAccessedAt)}</span>
+            <span class="px-1.5" aria-hidden="true">
+              ·
+            </span>
+            <span class={cn('tabular-nums whitespace-nowrap', expiryTone(left))}>{expiryText(left)}</span>
+            {link.access === 'view' && (
+              <>
+                <span class="px-1.5" aria-hidden="true">
+                  ·
+                </span>
+                <span class="whitespace-nowrap">View only</span>
+              </>
+            )}
+          </p>
+        </div>
+        <div class="relative flex shrink-0 items-center gap-1">
+          {mode.value === 'confirming' ? (
+            <>
+              <button type="button" class={cn(geist.actionBtn, CONFIRM_BTN)} onClick={() => void releaseLink(link.id)}>
+                Remove
+              </button>
+              <button
+                type="button"
+                class={cn(geist.actionBtn, geist.ctlIdle, CONFIRM_LAST)}
+                onClick={() => {
+                  mode.value = 'idle';
+                }}
+              >
+                Cancel
+              </button>
+            </>
+          ) : (
+            <>
+              <CopyButton id={link.id} />
+              <MoveMenu link={link} class={cn(geist.ctlSm, geist.ctlIdle, ROW_CTL)} />
+              <button
+                type="button"
+                aria-label="Link settings"
+                aria-expanded={mode.value === 'settings'}
+                class={cn(
+                  geist.ctlSm,
+                  geist.ctlIdle,
+                  ROW_CTL,
+                  mode.value === 'settings' && 'bg-(--ds-gray-alpha-100) text-(--ds-gray-1000)',
+                )}
+                onClick={() => {
+                  mode.value = mode.value === 'settings' ? 'idle' : 'settings';
+                }}
+              >
+                <Settings2 size={14} strokeWidth={1.5} aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                aria-label="Remove from your links"
+                class={cn(geist.ctlSm, geist.ctlIdle, ROW_CTL, 'hover:text-(--ds-red-700)')}
+                onClick={() => {
+                  mode.value = 'confirming';
+                }}
+              >
+                <Trash2 size={14} strokeWidth={1.5} aria-hidden="true" />
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+      {mode.value === 'settings' && (
+        <div class="border-t border-(--ds-gray-alpha-400) pt-3">
+          <LinkSettings link={link} />
+        </div>
+      )}
+    </li>
+  );
+}
+
+/**
+ * Three rows of the shape that is coming. The height is pinned to a real row's
+ * 71px so the list does not resize under the reader when the data lands, and
+ * the widths vary so three identical bars do not read as a repeating pattern.
+ */
+const SKELETON_ROWS = [
+  ['w-40', 'w-56'],
+  ['w-56', 'w-48'],
+  ['w-32', 'w-52'],
+];
+
+function Skeleton() {
+  return (
+    <ul class={cn(PANEL, 'divide-y divide-(--ds-gray-alpha-400)')}>
+      {SKELETON_ROWS.map(([title, meta]) => (
+        <li key={title} class="flex h-[71px] animate-pulse flex-col justify-center gap-2 px-4">
+          <div class={cn('h-3.5 rounded-sm bg-(--ds-gray-alpha-200)', title)} />
+          <div class={cn('h-3 rounded-sm bg-(--ds-gray-alpha-100)', meta)} />
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function Empty() {
+  return (
+    <div class={cn(PANEL, 'flex flex-col items-center gap-2 px-6 py-16 text-center')}>
+      <Link2 size={24} strokeWidth={1.5} class="text-(--ds-gray-700)" aria-hidden="true" />
+      <span class="text-ui font-medium text-(--ds-gray-1000)">No saved links yet</span>
+      <span class="text-meta leading-body max-w-[28rem] text-balance text-(--ds-gray-900)">
+        Open a link you made and choose <span class="text-(--ds-gray-1000)">Save to my links</span>, or annotate a page
+        to make one.
+      </span>
+      <a href="/" class={cn(submitBtn, 'mt-4 no-underline')}>
+        Annotate a page
+      </a>
+    </div>
+  );
+}
+
+export function Dashboard() {
+  const account = user.value;
+  const all = links.value;
+  const filter = folderFilter.value;
+  const list = all.filter((link) => inFilter({ link, filter }));
+  const loading = linksLoading.value && all.length === 0;
+  return (
+    <div class={cn(APP_MEASURE, 'py-8 sm:py-10')}>
+      {/* Baselines, not centres: the count is a subtitle to the title, and the
+          action beside them is a box that centres on its own row instead. */}
+      <div class="mb-5 flex items-end justify-between gap-4">
+        <div class="flex items-baseline gap-2.5">
+          <h1 class="text-heading tracking-ui font-semibold text-(--ds-gray-1000)">Your links</h1>
+          {list.length > 0 && (
+            <span class="text-meta tabular-nums text-(--ds-gray-900)">
+              {list.length} link{list.length === 1 ? '' : 's'}
+            </span>
+          )}
+        </div>
+        {all.length > 0 && (
+          <a href="/" class={cn(submitBtn, 'no-underline')}>
+            Annotate a page
+          </a>
+        )}
+      </div>
+
+      {all.length > 0 && <FolderBar />}
+
+      {loading ? (
+        <Skeleton />
+      ) : all.length === 0 ? (
+        <Empty />
+      ) : list.length === 0 ? (
+        <div class={cn(PANEL, 'text-meta px-6 py-12 text-center text-(--ds-gray-900)')}>
+          Nothing here yet. Use <span class="text-(--ds-gray-1000)">Move to folder</span> on a link.
+        </div>
+      ) : (
+        <>
+          <ul class={cn(PANEL, 'divide-y divide-(--ds-gray-alpha-400)')}>
+            {list.map((link) => (
+              <LinkRow key={link.id} link={link} />
+            ))}
+          </ul>
+          {/* Said once, at the foot of the list, rather than re-explained on
+              every row — which is what the per-row "unless opened" was doing. */}
+          <p class="text-meta leading-body mt-3 text-(--ds-gray-900)">
+            Links you keep here are not deleted. Give one an expiry in its settings if you want it to go, or remove it
+            to put it back on the 90-day clock.
+          </p>
+        </>
+      )}
+
+      {/* The address, for the reader who lands here from a magic link and wants
+          to know which account it signed them into. The bar carries it on wider
+          screens; this is the small-screen answer. */}
+      {account ? (
+        <p class="text-meta mt-8 truncate text-(--ds-gray-900) sm:hidden">Signed in as {account.email}</p>
+      ) : null}
+      <FolderDialog />
+    </div>
+  );
+}

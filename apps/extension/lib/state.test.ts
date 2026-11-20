@@ -1,0 +1,1188 @@
+import { beforeEach, describe, expect, mock, test } from 'bun:test';
+import type { AreaOp, CommentOp, DrawOp, InspectOp, SelectionOp, TextOp } from '@marklayer/types/ops';
+import { setAnalytics } from './analytics';
+import { ELEMENT_INSPECTOR_HEADING } from './selector';
+import { toasts } from './toasts';
+
+/* No IndexedDB in the test DOM - `idb-keyval` throws synchronously reaching for
+   it - so a Map stands in, letting a test read back what would survive a reload. */
+const savedDrafts = new Map<string, unknown>();
+mock.module('idb-keyval', () => ({
+  createStore: () => ({}),
+  get: async (key: string) => savedDrafts.get(key),
+  set: async (key: string, value: unknown) => {
+    savedDrafts.set(key, structuredClone(value));
+  },
+  del: async (key: string) => {
+    savedDrafts.delete(key);
+  },
+}));
+
+const { getCommentMeta } = await import('./comment-meta');
+const { configureHost } = await import('./host-config');
+const { annotatedUrl } = await import('./page-url');
+const { addGuide, clearGuides, flipGuide, guides, removeGuide, updateGuide } = await import('./guides');
+const { ensureScrollTickListener, scrollTick } = await import('./host-mutations');
+const { cursorColorName, localUser, onProfileChange, setUserColor } = await import('./identity');
+const {
+  addToInspectorStack,
+  buildInspectorStackPrompt,
+  clearInspectorStack,
+  copyInspectorStack,
+  inspectorStack,
+  inspectorStackOpen,
+  removeFromInspectorStack,
+} = await import('./inspector-stack');
+const {
+  areas,
+  clearAll,
+  comments,
+  commentCounter,
+  deleteOp,
+  duplicateLastOp,
+  getReplies,
+  inspects,
+  onChange,
+  operations,
+  placeOp,
+  pushOp,
+  pushReply,
+  redo,
+  rootComments,
+  selections,
+  setOpAssignee,
+  setOpPriority,
+  setOpStatus,
+  undo,
+  undoRedoFlash,
+  undoStack,
+} = await import('./ops');
+const {
+  color,
+  colorName,
+  cycleTheme,
+  isOutputDetail,
+  markersVisible,
+  outputDetail,
+  setColor,
+  setOutputDetail,
+  theme,
+  toggleClearOnCopy,
+  toggleMarkersVisible,
+} = await import('./prefs');
+const { peerCount, peers } = await import('./presence');
+const { relabelOwnWork, setUserName } = await import('./rename');
+const {
+  activeTool,
+  altHeld,
+  elementToolsUnavailable,
+  handTool,
+  measureActive,
+  moveSlot,
+  slotTool,
+  panActive,
+  panBy,
+  panScrollBy,
+  selectTool,
+  selectionCaptureArmed,
+  spaceHeld,
+  toolSlots,
+  visibleSlots,
+} = await import('./tool-state');
+const { isToolGroup, parseToolSlots, SHORTCUTS, TOOL_GROUPS, TOOLS } = await import('./tools');
+const { initHost } = await import('./host');
+const { createDraftStore } = await import('./drafts');
+const { localIdentity } = await import('./identity-store');
+initHost({ capabilities: { drafts: createDraftStore, identity: localIdentity } });
+const { showSettings, showShareDialog, toggleUiHidden, uiHidden } = await import('./ui-state');
+
+const base = { color: '#000', lineWidth: 2 };
+
+const comment = (over: Partial<CommentOp> & { id: string }): CommentOp => ({
+  ...base,
+  tool: 'comment',
+  num: 1,
+  text: 'x',
+  x: 10,
+  y: 20,
+  ts: 0,
+  ...over,
+});
+
+const text = (id: string, over: Partial<TextOp> = {}): TextOp => ({
+  ...base,
+  id,
+  tool: 'text',
+  text: 'label',
+  x: 0,
+  y: 0,
+  fontSize: 14,
+  ...over,
+});
+
+const selection = (id: string, over: Partial<SelectionOp> = {}): SelectionOp => ({
+  ...base,
+  id,
+  tool: 'selection',
+  text: 'quote',
+  rects: [{ x: 0, y: 0, width: 5, height: 5 }],
+  ts: 0,
+  ...over,
+});
+
+const area = (id: string, over: Partial<AreaOp> = {}): AreaOp => ({
+  ...base,
+  id,
+  tool: 'area',
+  startX: 0,
+  startY: 0,
+  endX: 10,
+  endY: 10,
+  ts: 0,
+  ...over,
+});
+
+const inspect = (id: string): InspectOp => ({
+  ...base,
+  id,
+  tool: 'inspect',
+  selector: 'h1',
+  tag: 'h1',
+  markdown: '',
+  rect: { x: 0, y: 0, width: 10, height: 10 },
+  ts: 0,
+});
+
+beforeEach(() => {
+  operations.value = [];
+  undoStack.value = [];
+  activeTool.value = 'navigate';
+  onChange.value = null;
+  configureHost({});
+});
+
+describe('derived op views', () => {
+  test('partitions one pass of operations into every view a layer reads', () => {
+    operations.value = [
+      comment({ id: 'c1' }),
+      comment({ id: 'r1', parentId: 'c1' }),
+      selection('s1'),
+      area('a1'),
+      inspect('i1'),
+      text('t1'),
+    ];
+    expect(comments.value.map((o) => o.id)).toEqual(['c1', 'r1']);
+    expect(rootComments.value.map((o) => o.id)).toEqual(['c1']);
+    expect(selections.value.map((o) => o.id)).toEqual(['s1']);
+    expect(areas.value.map((o) => o.id)).toEqual(['a1']);
+    expect(inspects.value.map((o) => o.id)).toEqual(['i1']);
+  });
+
+  test('keeps replies out of the root list and reachable by their parent', () => {
+    operations.value = [
+      comment({ id: 'c1' }),
+      comment({ id: 'r1', parentId: 'c1' }),
+      comment({ id: 'r2', parentId: 'c1' }),
+    ];
+    expect(getReplies('c1').map((o) => o.id)).toEqual(['r1', 'r2']);
+    expect(getReplies('nobody')).toEqual([]);
+  });
+
+  test('counts every comment, replies included, because that is what numbers the next one', () => {
+    operations.value = [comment({ id: 'c1' }), comment({ id: 'r1', parentId: 'c1' })];
+    expect(commentCounter.value).toBe(2);
+  });
+});
+
+describe('pushOp', () => {
+  test('appends the op and hands it to the peer transport', () => {
+    const sent: string[] = [];
+    onChange.value = (c) => {
+      if (c.type === 'op') sent.push(c.op.id);
+    };
+    operations.value = [text('t1')];
+    pushOp(text('t2'));
+    expect(operations.value.map((o) => o.id)).toEqual(['t1', 't2']);
+    expect(sent).toEqual(['t2']);
+  });
+
+  test('signs an op that arrives unsigned, so a stroke carries its author', () => {
+    pushOp(text('stroke'));
+    expect(operations.value.at(-1)).toMatchObject({ author: localUser.name, authorId: localUser.id });
+  });
+
+  test('drops the redo stack, so new work cannot be redone over', () => {
+    operations.value = [text('t1')];
+    undo();
+    expect(undoStack.value).toHaveLength(1);
+    pushOp(text('t2'));
+    expect(undoStack.value).toEqual([]);
+  });
+
+  test("reports what this person made, never the app's own seeded ops", () => {
+    const made: string[] = [];
+    configureHost({ actions: { onOpMade: (op) => made.push(op.id) } });
+    pushOp(comment({ id: 'c1' }));
+    placeOp(comment({ id: 'demo' }));
+    expect(made).toEqual(['c1']);
+  });
+});
+
+describe('pushReply', () => {
+  test('hangs the reply off its parent at the parent own point', () => {
+    operations.value = [comment({ id: 'c1', x: 300, y: 400 })];
+    pushReply({ parent: { id: 'c1', x: 300, y: 400 }, text: 'agreed' });
+
+    const reply = operations.value[1];
+    expect(reply).toMatchObject({ tool: 'comment', parentId: 'c1', text: 'agreed', x: 300, y: 400 });
+    expect(getReplies('c1')).toHaveLength(1);
+  });
+
+  test('numbers the reply past every existing comment', () => {
+    operations.value = [comment({ id: 'c1', num: 1 }), comment({ id: 'c2', num: 2 })];
+    pushReply({ parent: { id: 'c1', x: 0, y: 0 }, text: 'r' });
+    expect(operations.value[2]).toMatchObject({ num: 3 });
+  });
+
+  test('signs the reply with the local identity', () => {
+    operations.value = [comment({ id: 'c1' })];
+    pushReply({ parent: { id: 'c1', x: 0, y: 0 }, text: 'r' });
+    expect(operations.value[1]).toMatchObject({ author: localUser.name, authorId: localUser.id });
+  });
+
+  test('omits an empty mention list rather than storing one', () => {
+    // An empty array on the wire reads as "tagged nobody deliberately".
+    operations.value = [comment({ id: 'c1' })];
+    pushReply({ parent: { id: 'c1', x: 0, y: 0 }, text: 'r', mentions: [] });
+    expect(operations.value[1]).toMatchObject({ mentions: undefined });
+  });
+});
+
+describe('setOpStatus', () => {
+  test('keeps the legacy resolved boolean in step with the status', () => {
+    // A peer or an export still reading `resolved` must not disagree with the
+    // status printed beside it.
+    operations.value = [comment({ id: 'c1' })];
+    setOpStatus('c1', 'resolved');
+    expect(operations.value[0]).toMatchObject({ status: 'resolved', resolved: true });
+
+    setOpStatus('c1', 'in_progress');
+    expect(operations.value[0]).toMatchObject({ status: 'in_progress', resolved: false });
+  });
+
+  test('counts an approved thread as resolved to a reader that only knows the boolean', () => {
+    operations.value = [comment({ id: 'c1' })];
+    setOpStatus('c1', 'approved');
+    expect(operations.value[0]).toMatchObject({ status: 'approved', resolved: true });
+  });
+
+  test('sets only status on an annotation that never had the boolean', () => {
+    operations.value = [selection('s1')];
+    setOpStatus('s1', 'resolved');
+    expect(operations.value[0]).toMatchObject({ tool: 'selection', status: 'resolved' });
+    expect(operations.value[0]).not.toHaveProperty('resolved');
+  });
+
+  test('broadcasts the patch once, and not at all when the status already holds', () => {
+    const patches: Array<[string, Record<string, unknown>]> = [];
+    onChange.value = (c) => {
+      if (c.type === 'update_op') patches.push([c.opId, c.patch]);
+    };
+    operations.value = [comment({ id: 'c1', status: 'open' })];
+
+    setOpStatus('c1', 'open');
+    expect(patches).toEqual([]);
+
+    setOpStatus('c1', 'resolved');
+    expect(patches).toEqual([['c1', { status: 'resolved', resolved: true }]]);
+  });
+
+  test('reads a legacy resolved flag as the current status, so re-resolving is a no-op', () => {
+    const patches: string[] = [];
+    onChange.value = (c) => {
+      if (c.type === 'update_op') patches.push(c.opId);
+    };
+    operations.value = [comment({ id: 'c1', resolved: true })];
+    setOpStatus('c1', 'resolved');
+    expect(patches).toEqual([]);
+  });
+
+  test('leaves a canvas op alone - a stroke has no triage state', () => {
+    operations.value = [text('t1')];
+    setOpStatus('t1', 'resolved');
+    expect(operations.value[0]).not.toHaveProperty('status');
+  });
+});
+
+describe('setOpPriority and setOpAssignee', () => {
+  test('send an explicit null when cleared, since a dropped key reads as unchanged', () => {
+    const patches: Array<Record<string, unknown>> = [];
+    onChange.value = (c) => {
+      if (c.type === 'update_op') patches.push(c.patch);
+    };
+    operations.value = [comment({ id: 'c1', priority: 'high', assignee: 'Ada' })];
+
+    setOpPriority({ opId: 'c1', priority: null });
+    setOpAssignee({ opId: 'c1', assignee: null });
+    expect(patches).toEqual([{ priority: null }, { assignee: null }]);
+    expect(operations.value[0]).toMatchObject({ priority: null, assignee: null });
+  });
+
+  test('treat an absent field and an explicit null as the same value', () => {
+    const patches: Array<Record<string, unknown>> = [];
+    onChange.value = (c) => {
+      if (c.type === 'update_op') patches.push(c.patch);
+    };
+    operations.value = [comment({ id: 'c1' })];
+
+    setOpPriority({ opId: 'c1', priority: null });
+    setOpAssignee({ opId: 'c1', assignee: null });
+    expect(patches).toEqual([]);
+  });
+
+  test('apply a value and report it once', () => {
+    const patches: Array<Record<string, unknown>> = [];
+    onChange.value = (c) => {
+      if (c.type === 'update_op') patches.push(c.patch);
+    };
+    operations.value = [comment({ id: 'c1' })];
+
+    setOpPriority({ opId: 'c1', priority: 'low' });
+    setOpPriority({ opId: 'c1', priority: 'low' });
+    expect(patches).toEqual([{ priority: 'low' }]);
+  });
+});
+
+describe('undo and redo', () => {
+  test('pops the newest op and puts it back', () => {
+    operations.value = [text('t1'), text('t2')];
+    undo();
+    expect(operations.value.map((o) => o.id)).toEqual(['t1']);
+    redo();
+    expect(operations.value.map((o) => o.id)).toEqual(['t1', 't2']);
+    expect(undoStack.value).toEqual([]);
+  });
+
+  test('tells the peer transport which op went away', () => {
+    const undone: string[] = [];
+    onChange.value = (c) => {
+      if (c.type === 'undo') undone.push(c.opId);
+    };
+    operations.value = [text('t1')];
+    undo();
+    expect(undone).toEqual(['t1']);
+  });
+
+  test('does nothing on an empty canvas with nothing to restore', () => {
+    undo();
+    redo();
+    expect(operations.value).toEqual([]);
+  });
+
+  test('while the guide tool is active, undo pops the newest guide rather than the newest op', () => {
+    // Guide scratch work has to feel independent of the drawing underneath it.
+    const guide = addGuide('vertical', 200);
+    activeTool.value = 'guide';
+    pushOp(text('t1'));
+    undo();
+    expect(operations.value.map((o) => o.id)).toEqual(['t1']);
+    expect(guides.value).toEqual([]);
+    // One history: a guide undone can be redone like any other mark.
+    redo();
+    expect(guides.value.map((g) => g.id)).toEqual([guide.id]);
+  });
+
+  test('falls through to the normal undo when the guide tool is active with no guides', () => {
+    activeTool.value = 'guide';
+    operations.value = [text('t1')];
+    undo();
+    expect(operations.value).toEqual([]);
+  });
+
+  test('restores a whole cleared canvas, but only once the canvas is empty', () => {
+    const confirmed = withConfirm(true, () => {
+      operations.value = [text('t1'), text('t2')];
+      clearAll();
+    });
+    expect(confirmed).toBe(true);
+    expect(operations.value).toEqual([]);
+
+    undo();
+    expect(operations.value.map((o) => o.id)).toEqual(['t1', 't2']);
+    expect(undoStack.value).toEqual([]);
+  });
+
+  test('refuses to redo a clear, so a restore cannot be undone back to empty', () => {
+    withConfirm(true, () => {
+      operations.value = [text('t1')];
+      clearAll();
+    });
+    redo();
+    // The clear sentinel is not an op; replaying it would push a fake entry.
+    expect(operations.value).toEqual([]);
+    expect(undoStack.value).toHaveLength(1);
+  });
+
+  test('clearAll leaves the canvas alone when the prompt is declined', () => {
+    withConfirm(false, () => {
+      operations.value = [text('t1')];
+      clearAll();
+    });
+    expect(operations.value.map((o) => o.id)).toEqual(['t1']);
+    expect(undoStack.value).toEqual([]);
+  });
+});
+
+describe('history and triage survive a reload', () => {
+  // Past the 500ms draft debounce. Also drains a save an earlier test left pending,
+  // which would otherwise write the current ops and pass a test for the wrong reason.
+  const settle = () => Bun.sleep(550);
+  const draftOps = (): DrawOp[] => {
+    const [saved] = savedDrafts.values();
+    return Array.isArray(saved) ? saved : [];
+  };
+  const pushed: string[] = [];
+  beforeEach(() => {
+    pushed.length = 0;
+    onChange.value = (c) => {
+      if (c.type === 'op') pushed.push(c.op.id);
+    };
+  });
+
+  test('redo hands the op back to the room that undo took it from', () => {
+    pushOp(text('t1'));
+    undo();
+    pushed.length = 0;
+    redo();
+    expect(pushed).toEqual(['t1']);
+  });
+
+  test('undoing a clear saves the restored canvas and sends it back to the room', async () => {
+    await settle();
+    withConfirm(true, () => {
+      operations.value = [text('t1'), text('t2')];
+      clearAll();
+    });
+    undo();
+    await settle();
+    expect(draftOps().map((o) => o.id)).toEqual(['t1', 't2']);
+    expect(pushed).toEqual(['t1', 't2']);
+  });
+
+  test('a status, priority or assignee change is saved to the draft', async () => {
+    const cases: Array<[() => void, Partial<CommentOp>]> = [
+      [() => setOpStatus('c1', 'resolved'), { status: 'resolved', resolved: true }],
+      [() => setOpPriority({ opId: 'c1', priority: 'high' }), { priority: 'high' }],
+      [() => setOpAssignee({ opId: 'c1', assignee: 'Ada' }), { assignee: 'Ada' }],
+    ];
+    await settle();
+    for (const [change, expected] of cases) {
+      savedDrafts.clear();
+      operations.value = [comment({ id: 'c1' })];
+      change();
+      await settle();
+      expect(draftOps()[0]).toMatchObject(expected);
+    }
+  });
+});
+
+describe('deleteOp', () => {
+  test('removes the named op and reports it, leaving the rest in order', () => {
+    const undone: string[] = [];
+    onChange.value = (c) => {
+      if (c.type === 'undo') undone.push(c.opId);
+    };
+    operations.value = [text('t1'), text('t2'), text('t3')];
+    deleteOp('t2');
+    expect(operations.value.map((o) => o.id)).toEqual(['t1', 't3']);
+    expect(undone).toEqual(['t2']);
+  });
+
+  test('does nothing, and reports nothing, for an id that is not there', () => {
+    const undone: string[] = [];
+    onChange.value = (c) => {
+      if (c.type === 'undo') undone.push(c.opId);
+    };
+    operations.value = [text('t1')];
+    deleteOp('gone');
+    expect(operations.value).toHaveLength(1);
+    expect(undone).toEqual([]);
+  });
+});
+
+describe('duplicateLastOp', () => {
+  test('offsets the copy down-right and gives it a new identity', () => {
+    operations.value = [text('t1', { x: 100, y: 200 })];
+    duplicateLastOp();
+
+    const copy = operations.value[1];
+    expect(copy).toMatchObject({ tool: 'text', x: 112, y: 212 });
+    expect(copy?.id).not.toBe('t1');
+  });
+
+  test('drops the element anchor, which would otherwise snap the copy back', () => {
+    operations.value = [text('t1', { target: { selector: '#hero', tag: 'h1', markdown: '', offsetX: 0, offsetY: 0 } })];
+    duplicateLastOp();
+    expect(operations.value[1]).toMatchObject({ target: undefined });
+  });
+
+  test('cascades, because each copy becomes the new most-recent op', () => {
+    operations.value = [text('t1', { x: 0, y: 0 })];
+    duplicateLastOp();
+    duplicateLastOp();
+    expect(operations.value.map((o) => ('x' in o ? o.x : null))).toEqual([0, 12, 24]);
+  });
+
+  test('stamps an area copy with the time it was made, not the original', () => {
+    operations.value = [area('a1', { ts: 1 })];
+    duplicateLastOp();
+    const copy = operations.value[1];
+    expect(copy && 'ts' in copy && copy.ts).toBeGreaterThan(1);
+  });
+
+  test('skips past an op that cannot be translated', () => {
+    // A guide has no anchor point to nudge; the text below it is the real target.
+    operations.value = [text('t1', { x: 5, y: 5 })];
+    addGuide('vertical', 300);
+    duplicateLastOp();
+    expect(operations.value[operations.value.length - 1]).toMatchObject({ tool: 'text', x: 17, y: 17 });
+  });
+
+  test('leaves an empty canvas empty', () => {
+    duplicateLastOp();
+    expect(operations.value).toEqual([]);
+  });
+});
+
+describe('guides', () => {
+  test('ride the main op stream rather than living in their own state', () => {
+    const g = addGuide('vertical', 240);
+    expect(operations.value).toEqual([g]);
+    expect(guides.value).toEqual([g]);
+  });
+
+  test('move, and report the move once', () => {
+    const patches: Array<Record<string, unknown>> = [];
+    const g = addGuide('vertical', 240);
+    onChange.value = (c) => {
+      if (c.type === 'update_op') patches.push(c.patch);
+    };
+
+    updateGuide(g.id, 300);
+    updateGuide(g.id, 300);
+    expect(guides.value[0]?.position).toBe(300);
+    expect(patches).toEqual([{ position: 300 }]);
+  });
+
+  test('swap axis and land on the supplied perpendicular coordinate when flipped', () => {
+    // Without a new position the flipped guide would keep the old axis number and
+    // jump to an arbitrary spot.
+    const g = addGuide('vertical', 240);
+    flipGuide(g.id, 90);
+    expect(guides.value[0]).toMatchObject({ orientation: 'horizontal', position: 90 });
+  });
+
+  test('ignore a flip or a move aimed at an id that is not a guide', () => {
+    operations.value = [text('t1')];
+    flipGuide('t1', 10);
+    updateGuide('t1', 10);
+    expect(operations.value).toEqual([text('t1')]);
+  });
+
+  test('are removed individually and all at once, leaving other ops untouched', () => {
+    const a = addGuide('vertical', 100);
+    addGuide('horizontal', 200);
+    pushOp(text('t1'));
+
+    removeGuide(a.id);
+    expect(guides.value).toHaveLength(1);
+
+    clearGuides();
+    expect(guides.value).toEqual([]);
+    expect(operations.value.map((o) => o.id)).toEqual(['t1']);
+  });
+});
+
+describe('SHORTCUTS', () => {
+  test('shows the first binding per tool, as a readable label', () => {
+    // `arrow` lists KeyA then Shift+KeyL; the toolbar shows the first.
+    expect(SHORTCUTS.arrow).toBe('A');
+    expect(SHORTCUTS.highlight).toBe('⇧H');
+    expect(SHORTCUTS.rectangle).toBe('R');
+  });
+});
+
+describe('moveSlot', () => {
+  test("takes the target's place, after it moving right and before it moving left", () => {
+    const before = toolSlots.value;
+    toolSlots.value = parseToolSlots(null);
+    try {
+      moveSlot({ slot: 'navigate', to: 'shapes' });
+      expect(toolSlots.value.slice(0, 3)).toEqual(['draw', 'shapes', 'navigate']);
+      moveSlot({ slot: 'comment', to: 'draw' });
+      expect(toolSlots.value.slice(0, 2)).toEqual(['comment', 'draw']);
+      expect(toolSlots.value).toHaveLength(before.length);
+    } finally {
+      toolSlots.value = before;
+    }
+  });
+
+  test('lands where it was dropped on the bar when the host hides some slots', () => {
+    const before = toolSlots.value;
+    toolSlots.value = parseToolSlots(null);
+    elementToolsUnavailable.value = true;
+    try {
+      moveSlot({ slot: 'eraser', to: 'guide' });
+      expect(toolSlots.value.slice(-2)).toEqual(['guide', 'eraser']);
+    } finally {
+      elementToolsUnavailable.value = false;
+      toolSlots.value = before;
+    }
+  });
+
+  test('a move onto itself leaves the order untouched', () => {
+    const before = toolSlots.value;
+    moveSlot({ slot: 'comment', to: 'comment' });
+    expect(toolSlots.value).toBe(before);
+  });
+});
+
+describe('relabelOwnWork', () => {
+  test('carries a rename onto your own annotations and anything assigned to you', () => {
+    setUserName('Old Name');
+    relabelOwnWork();
+    operations.value = [
+      comment({ id: 'mine', author: 'Old Name', authorId: localUser.id }),
+      comment({ id: 'theirs', author: 'Someone Else', authorId: 'other' }),
+      comment({ id: 'assigned', author: 'Someone Else', authorId: 'other', assignee: 'Old Name' }),
+      text('t1'),
+    ];
+
+    setUserName('New Name');
+    expect(relabelOwnWork()).toBe(2);
+    expect(operations.value[0]).toMatchObject({ author: 'New Name' });
+    // Someone else's unassigned thread is untouched by your rename.
+    expect(operations.value[1]).toMatchObject({ author: 'Someone Else' });
+    expect(operations.value[1]).not.toHaveProperty('assignee');
+    expect(operations.value[2]).toMatchObject({ author: 'Someone Else', assignee: 'New Name' });
+  });
+
+  test('matches a legacy op with no authorId by the old name alone', () => {
+    setUserName('Legacy Name');
+    relabelOwnWork();
+    operations.value = [comment({ id: 'old', author: 'Legacy Name' })];
+    setUserName('Current Name');
+    expect(relabelOwnWork()).toBe(1);
+    expect(operations.value[0]).toMatchObject({ author: 'Current Name' });
+  });
+
+  test('reports zero and leaves the array identity alone when nothing carries the old name', () => {
+    // Signals compare by identity, so writing a fresh array would re-partition
+    // the op index and re-render every layer for a rename that touched nothing.
+    setUserName('Nobody Wrote This');
+    relabelOwnWork();
+    operations.value = [comment({ id: 'theirs', author: 'Someone Else', authorId: 'other' })];
+    const before = operations.value;
+
+    setUserName('Another Name');
+    expect(relabelOwnWork()).toBe(0);
+    expect(operations.value).toBe(before);
+  });
+
+  test('is safe to call with no rename pending', () => {
+    expect(relabelOwnWork()).toBe(0);
+  });
+});
+
+/**
+ * Run `body` with the confirm dialog answered, since happy-dom has none.
+ * Returns whether it was actually asked.
+ */
+function withConfirm(answer: boolean, body: () => void): boolean {
+  const original = window.confirm;
+  let asked = false;
+  const set = (value: typeof window.confirm) =>
+    Object.defineProperty(window, 'confirm', { value, configurable: true, writable: true });
+  set(() => {
+    asked = true;
+    return answer;
+  });
+  try {
+    body();
+  } finally {
+    set(original);
+  }
+  return asked;
+}
+
+describe('colorName', () => {
+  test('names a palette colour, case-insensitively', () => {
+    expect(colorName('#f43f5e')).toBe('Red');
+    expect(colorName('#F43F5E')).toBe('Red');
+  });
+
+  test('falls back to the hex for a colour no longer in the palette', () => {
+    // A value restored from storage still has to label itself as something.
+    expect(colorName('#123456')).toBe('#123456');
+  });
+});
+
+describe('cursorColorName', () => {
+  test('names a cursor colour and falls back to the hex', () => {
+    expect(cursorColorName('#EC4899')).toBe('Pink');
+    expect(cursorColorName('#abcdef')).toBe('#ABCDEF');
+  });
+});
+
+describe('isOutputDetail', () => {
+  test('accepts the four tiers and nothing else', () => {
+    for (const tier of ['compact', 'standard', 'detailed', 'forensic']) {
+      expect(isOutputDetail(tier)).toBe(true);
+    }
+    for (const bad of ['verbose', '', null, undefined, 1, {}, ['standard']]) {
+      expect(isOutputDetail(bad)).toBe(false);
+    }
+  });
+});
+
+describe('selectionCaptureArmed', () => {
+  test('needs a tool that captures selections and the markers to be visible', () => {
+    // With markers off there is nothing to show for a captured passage.
+    activeTool.value = 'selection';
+    if (!markersVisible.value) toggleMarkersVisible();
+    expect(selectionCaptureArmed.value).toBe(true);
+
+    toggleMarkersVisible();
+    expect(selectionCaptureArmed.value).toBe(false);
+    toggleMarkersVisible();
+
+    activeTool.value = 'rectangle';
+    expect(selectionCaptureArmed.value).toBe(false);
+  });
+});
+
+describe('toolSlots', () => {
+  const reachable = (slots: readonly string[]) => slots.flatMap((s) => (isToolGroup(s) ? [...TOOL_GROUPS[s]] : [s]));
+
+  test('reaches every tool exactly once, so no button can go missing', () => {
+    expect(reachable(toolSlots.value).sort()).toEqual([...TOOLS].sort());
+    expect(new Set(reachable(toolSlots.value)).size).toBe(TOOLS.length);
+  });
+
+  test("migrates an order saved before grouping: each group takes its first member's place", () => {
+    const slots = parseToolSlots(
+      JSON.stringify(['comment', 'arrow', 'navigate', 'highlight', 'circle', 'pen', 'gone']),
+    );
+    expect(slots.slice(0, 4)).toEqual(['comment', 'shapes', 'navigate', 'draw']);
+    expect(reachable(slots).sort()).toEqual([...TOOLS].sort());
+  });
+
+  test('drops the element tools when the host cannot support them', () => {
+    expect(visibleSlots.value).toBe(toolSlots.value);
+
+    elementToolsUnavailable.value = true;
+    expect(visibleSlots.value).not.toContain('inspect');
+    expect(visibleSlots.value).not.toContain('multiInspect');
+    expect(visibleSlots.value).not.toContain('measure');
+    // Everything else survives.
+    expect(visibleSlots.value).toContain('comment');
+    elementToolsUnavailable.value = false;
+  });
+
+  test('a shortcut cannot arm a tool whose button is gone', () => {
+    activeTool.value = 'comment';
+    elementToolsUnavailable.value = true;
+    selectTool({ tool: 'measure', via: 'shortcut' });
+    expect(activeTool.value).toBe('comment');
+    elementToolsUnavailable.value = false;
+    activeTool.value = 'navigate';
+  });
+
+  test('a tool already armed when the host loses the element tree falls back to navigate', () => {
+    activeTool.value = 'inspect';
+    elementToolsUnavailable.value = true;
+    expect(activeTool.peek()).toBe('navigate');
+    elementToolsUnavailable.value = false;
+  });
+});
+
+describe('groupFaces', () => {
+  test('a group shows the member last used, however it was picked', () => {
+    selectTool({ tool: 'circle', via: 'shortcut' });
+    selectTool({ tool: 'navigate', via: 'toolbar' });
+    expect(slotTool('shapes')).toBe('circle');
+  });
+});
+
+describe('selectTool', () => {
+  test('re-picking the active tool is a no-op write and leaves no via pending', () => {
+    // A `via` left over would be spent on whatever automatic switch came next.
+    const reported: Array<string | number | boolean | null | undefined> = [];
+    setAnalytics({ sink: (_e, props) => reported.push(props?.via), surface: 'extension' });
+    try {
+      selectTool({ tool: 'circle', via: 'toolbar' });
+      selectTool({ tool: 'circle', via: 'toolbar' });
+      activeTool.value = 'navigate';
+      expect(reported).toEqual(['toolbar', 'other']);
+    } finally {
+      setAnalytics({ sink: () => {}, surface: 'extension' });
+    }
+  });
+});
+
+describe('toggleUiHidden', () => {
+  test('drops the dialogs and disarms the drawing tool on the way out', () => {
+    // Drawing with no toolbar means no colour, no width and no visible tool.
+    showSettings.value = true;
+    showShareDialog.value = true;
+    activeTool.value = 'rectangle';
+
+    toggleUiHidden();
+    expect(uiHidden.value).toBe(true);
+    expect(showSettings.value).toBe(false);
+    expect(showShareDialog.value).toBe(false);
+    // `peek()`, not `.value`: the assignment above narrows `.value` to 'rectangle',
+    // and the checker has no idea `toggleUiHidden` just changed it.
+    expect(activeTool.peek()).toBe('navigate');
+
+    toggleUiHidden();
+    expect(uiHidden.value).toBe(false);
+  });
+
+  test('leaves the tool alone when bringing the interface back', () => {
+    toggleUiHidden();
+    activeTool.value = 'comment';
+    toggleUiHidden();
+    expect(activeTool.value).toBe('comment');
+    activeTool.value = 'navigate';
+  });
+});
+
+describe('getCommentMeta', () => {
+  test('records the page the annotation is about, not the page it was read on', () => {
+    // The web viewer wraps a proxied page: without this the meta would say the
+    // share URL for every comment.
+    annotatedUrl.value = 'https://example.com/pricing';
+    expect(getCommentMeta().url).toBe('https://example.com/pricing');
+
+    annotatedUrl.value = null;
+    expect(getCommentMeta().url).toBe(location.href);
+  });
+
+  test('carries the viewport and the detected environment', () => {
+    const meta = getCommentMeta();
+    expect(meta.viewport).toEqual({ width: window.innerWidth, height: window.innerHeight });
+    expect(typeof meta.browser).toBe('string');
+    expect(typeof meta.os).toBe('string');
+  });
+});
+
+describe('inspector stack', () => {
+  const item = (over: { markdown?: string; comment?: string } = {}) => ({
+    selector: 'h1#hero',
+    comment: '',
+    markdown: `${ELEMENT_INSPECTOR_HEADING}\n\n**Selector:** \`h1#hero\`\n`,
+    ...over,
+  });
+
+  beforeEach(() => {
+    clearInspectorStack();
+  });
+
+  test('opens itself when the first element is stacked', () => {
+    addToInspectorStack(item());
+    expect(inspectorStack.value).toHaveLength(1);
+    expect(inspectorStackOpen.value).toBe(true);
+  });
+
+  test('gives each entry its own id, so identical picks stay separable', () => {
+    addToInspectorStack(item());
+    addToInspectorStack(item());
+    const [a, b] = inspectorStack.value;
+    expect(a?.id).not.toBe(b?.id);
+  });
+
+  test('closes itself once the last entry is removed, but not before', () => {
+    addToInspectorStack(item());
+    addToInspectorStack(item());
+    const first = inspectorStack.value[0];
+    if (!first) throw new Error('nothing stacked');
+
+    removeFromInspectorStack(first.id);
+    expect(inspectorStackOpen.value).toBe(true);
+
+    const last = inspectorStack.value[0];
+    if (!last) throw new Error('nothing stacked');
+    removeFromInspectorStack(last.id);
+    expect(inspectorStackOpen.value).toBe(false);
+  });
+
+  test('ignores a removal for an id that is not stacked', () => {
+    addToInspectorStack(item());
+    removeFromInspectorStack('nope');
+    expect(inspectorStack.value).toHaveLength(1);
+  });
+});
+
+describe('buildInspectorStackPrompt', () => {
+  const stacked = (entries: { markdown: string; comment?: string }[]) => {
+    clearInspectorStack();
+    for (const e of entries) addToInspectorStack({ selector: 'h1', comment: '', ...e });
+  };
+
+  test('counts the tasks, singular and plural', () => {
+    stacked([{ markdown: 'A' }]);
+    expect(buildInspectorStackPrompt()).toContain('# Element changes (1 task)');
+    stacked([{ markdown: 'A' }, { markdown: 'B' }]);
+    expect(buildInspectorStackPrompt()).toContain('# Element changes (2 tasks)');
+  });
+
+  test('titles a block with its instruction, or numbers it when there is none', () => {
+    stacked([{ markdown: 'A', comment: 'make it bigger' }, { markdown: 'B' }]);
+    const prompt = buildInspectorStackPrompt();
+    expect(prompt).toContain('## Task 1: make it bigger');
+    expect(prompt).toContain('## Element 2');
+  });
+
+  test('strips the per-element inspector heading, keeping one document heading', () => {
+    // Each entry arrives with its own "## Element Inspector"; repeating it inside
+    // a bundled prompt reads as a wall of identical headings to the agent.
+    stacked([
+      { markdown: `${ELEMENT_INSPECTOR_HEADING}\n\n**Selector:** \`h1\`\n` },
+      { markdown: `${ELEMENT_INSPECTOR_HEADING}\n\n**Selector:** \`h2\`\n` },
+    ]);
+    const prompt = buildInspectorStackPrompt();
+    expect(prompt).not.toContain(ELEMENT_INSPECTOR_HEADING);
+    expect(prompt).toContain('**Selector:** `h1`');
+    expect(prompt).toContain('**Selector:** `h2`');
+  });
+
+  test('keeps markdown that does not lead with the heading intact', () => {
+    stacked([{ markdown: '**Selector:** `h1`' }]);
+    expect(buildInspectorStackPrompt()).toContain('**Selector:** `h1`');
+  });
+
+  test('separates the blocks with a rule', () => {
+    stacked([{ markdown: 'A' }, { markdown: 'B' }]);
+    expect(buildInspectorStackPrompt()).toContain('\n\n---\n\n');
+  });
+
+  test('produces a valid prompt for an empty stack rather than throwing', () => {
+    clearInspectorStack();
+    expect(buildInspectorStackPrompt()).toBe('# Element changes (0 tasks)\n\n\n');
+  });
+});
+
+describe('panBy', () => {
+  test('scrolls the host window when no other scroller is registered', () => {
+    panScrollBy.value = null;
+    window.scrollTo(0, 0);
+    panBy(0, 120);
+    expect(window.scrollY).toBe(120);
+    window.scrollTo(0, 0);
+  });
+
+  test('hands the delta to the registered scroller instead - the proxied iframe', () => {
+    const moves: Array<[number, number]> = [];
+    panScrollBy.value = (dx, dy) => moves.push([dx, dy]);
+    try {
+      panBy(10, -20);
+      expect(moves).toEqual([[10, -20]]);
+      expect(window.scrollY).toBe(0);
+    } finally {
+      panScrollBy.value = null;
+    }
+  });
+});
+
+describe('panActive', () => {
+  test('is on while the hand tool is toggled or space is held', () => {
+    expect(panActive.value).toBe(false);
+    handTool.value = true;
+    expect(panActive.value).toBe(true);
+    handTool.value = false;
+
+    spaceHeld.value = true;
+    expect(panActive.value).toBe(true);
+    spaceHeld.value = false;
+    expect(panActive.value).toBe(false);
+  });
+});
+
+describe('measureActive', () => {
+  test('is on under the measure tool, or with Alt held from any tool', () => {
+    // Figma shows measurements on Alt-hover whatever tool is armed.
+    activeTool.value = 'measure';
+    expect(measureActive.value).toBe(true);
+
+    activeTool.value = 'rectangle';
+    expect(measureActive.value).toBe(false);
+    altHeld.value = true;
+    expect(measureActive.value).toBe(true);
+    altHeld.value = false;
+  });
+});
+
+describe('theme', () => {
+  test('cycles back to where it started, saving every step', () => {
+    const start = theme.value;
+    const step = () => {
+      cycleTheme();
+      expect(localStorage.getItem('ml-theme')).toBe(theme.value);
+      return theme.value;
+    };
+    expect(new Set([step(), step(), step()]).size).toBe(3);
+    expect(theme.value).toBe(start);
+  });
+});
+
+describe('setColor and setOutputDetail', () => {
+  test('persist the choice', () => {
+    setColor('#22c55e');
+    expect(color.value).toBe('#22c55e');
+    expect(localStorage.getItem('ml-color')).toBe('#22c55e');
+
+    setOutputDetail('forensic');
+    expect(outputDetail.value).toBe('forensic');
+    expect(localStorage.getItem('ml-output-detail')).toBe('forensic');
+
+    setOutputDetail('standard');
+    expect(localStorage.getItem('ml-output-detail')).toBeNull();
+  });
+});
+
+describe('peerCount', () => {
+  test('counts the connected peers plus you', () => {
+    // The label reads "3 here", and you are one of them.
+    peers.value = new Map();
+    expect(peerCount.value).toBe(1);
+
+    peers.value = new Map([
+      ['a', { id: 'a', name: 'Ada', color: '#000', cursor: null, lastSeen: 0 }],
+      ['b', { id: 'b', name: 'Bo', color: '#000', cursor: null, lastSeen: 0 }],
+    ]);
+    expect(peerCount.value).toBe(3);
+    peers.value = new Map();
+  });
+});
+
+describe('setUserColor', () => {
+  test('persists the choice and announces it once', () => {
+    const announced: Array<[string, string]> = [];
+    // The local colour starts as a random palette pick, so establish a known one
+    // before testing that re-picking it is a no-op.
+    setUserColor('#3b82f6');
+    onProfileChange.value = (name, colour) => announced.push([name, colour]);
+    try {
+      setUserColor('#06b6d4');
+      expect(localUser.color).toBe('#06b6d4');
+      expect(localStorage.getItem('ml-usercolor')).toBe('#06b6d4');
+
+      // Re-picking the same colour is not a change.
+      setUserColor('#06b6d4');
+      expect(announced.filter(([, c]) => c === '#06b6d4')).toHaveLength(1);
+    } finally {
+      onProfileChange.value = null;
+    }
+  });
+});
+
+describe('undoRedoFlash', () => {
+  test('is bumped by an undo and by a redo, to trigger the canvas flash', () => {
+    operations.value = [text('t1')];
+    const start = undoRedoFlash.value;
+    undo();
+    expect(undoRedoFlash.value).toBe(start + 1);
+    redo();
+    expect(undoRedoFlash.value).toBe(start + 2);
+  });
+
+  test('is not bumped when there was nothing to undo', () => {
+    operations.value = [];
+    undoStack.value = [];
+    const start = undoRedoFlash.value;
+    undo();
+    redo();
+    expect(undoRedoFlash.value).toBe(start);
+  });
+});
+
+describe('copyInspectorStack', () => {
+  const stubClipboard = (writeText: () => Promise<void>) =>
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+
+  beforeEach(() => {
+    clearInspectorStack();
+    toasts.value = [];
+  });
+
+  test('says so rather than copying an empty prompt', async () => {
+    stubClipboard(() => Promise.reject(new Error('should not be called')));
+    copyInspectorStack();
+    await tick();
+    expect(toasts.value[0]).toMatchObject({ message: 'Stack is empty', type: 'info' });
+  });
+
+  test('copies the bundled prompt and counts the tasks in the confirmation', async () => {
+    let copied = '';
+    Object.defineProperty(navigator, 'clipboard', {
+      value: {
+        writeText: (t: string) => {
+          copied = t;
+          return Promise.resolve();
+        },
+      },
+      configurable: true,
+    });
+
+    addToInspectorStack({ selector: 'h1', comment: '', markdown: 'A' });
+    addToInspectorStack({ selector: 'h2', comment: '', markdown: 'B' });
+    copyInspectorStack();
+    await tick();
+
+    expect(copied).toBe(buildInspectorStackPrompt());
+    expect(toasts.value.at(-1)).toMatchObject({ message: 'Copied 2 tasks for AI!' });
+  });
+
+  test('keeps the stack unless the auto-clear setting is on', async () => {
+    stubClipboard(() => Promise.resolve());
+    addToInspectorStack({ selector: 'h1', comment: '', markdown: 'A' });
+
+    copyInspectorStack();
+    await tick();
+    expect(inspectorStack.value).toHaveLength(1);
+
+    toggleClearOnCopy();
+    try {
+      copyInspectorStack();
+      await tick();
+      expect(inspectorStack.value).toEqual([]);
+    } finally {
+      toggleClearOnCopy();
+    }
+  });
+});
+
+describe('ensureScrollTickListener', () => {
+  test('coalesces a burst of scroll events into one tick per frame', async () => {
+    // Anchored annotations re-resolve their selectors on every tick, so a tick
+    // per scroll event would re-query the document dozens of times a second.
+    ensureScrollTickListener();
+    const start = scrollTick.value;
+    for (let i = 0; i < 5; i++) window.dispatchEvent(new Event('scroll'));
+    expect(scrollTick.value).toBe(start);
+
+    await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    expect(scrollTick.value).toBe(start + 1);
+  });
+
+  test('a resize ticks too, since it moves anchored annotations just as much', async () => {
+    ensureScrollTickListener();
+    const start = scrollTick.value;
+    window.dispatchEvent(new Event('resize'));
+    await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    expect(scrollTick.value).toBe(start + 1);
+  });
+});

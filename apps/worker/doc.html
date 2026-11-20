@@ -1,0 +1,125 @@
+<!doctype html>
+<!-- The host reads these the instant the iframe fires `load` (useRenderOutcome.ts),
+     which is long before the file has been fetched and painted. They mark who
+     served the page, not that rendering finished, so they have to be in the
+     markup — set from script they always lose the race and every document reads
+     as a failed render. Failures surface as .doc-error inside the frame
+     instead. -->
+<html lang="en" data-marklayer="1" data-doc="1">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Document · MarkLayer</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #525659;
+      }
+
+      #doc-root {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        /* A single image shorter than the frame sits in the middle of it rather
+           than pinned to the top of a field of grey. `safe` is what makes that
+           usable on the other side: a tall PDF overflows, and unsafe centring
+           would push its first page up out of reach where nothing can scroll
+           back to it. Where `safe` is not understood the whole declaration is
+           dropped, which leaves the top-aligned stack this had before. */
+        justify-content: safe center;
+        min-height: 100vh;
+      }
+
+      .doc-page {
+        position: relative;
+        margin: 12px 0;
+        background: #fff;
+        box-sizing: border-box;
+      }
+
+      .doc-page canvas,
+      .doc-page img {
+        display: block;
+      }
+
+      .doc-error {
+        margin: 24px;
+        color: #eee;
+        font-family: monospace;
+        white-space: pre-wrap;
+      }
+
+      /* The text-layer contract, taken from pdfjs-dist/web/pdf_viewer.css. Not
+         imported wholesale: that file is 160KB of viewer chrome this page has
+         none of, and pulls in 39 SVG assets. TextLayer.render() positions each
+         span with an inline left/top percentage and sets --font-height,
+         --scale-x and --rotate on it — the font-size and transform below are
+         what consume them, and without them every span renders at the inherited
+         size and text selection lands in the wrong place. */
+      .textLayer {
+        position: absolute;
+        inset: 0;
+        overflow: clip;
+        line-height: 1;
+        letter-spacing: normal;
+        word-spacing: normal;
+        text-align: initial;
+        text-size-adjust: none;
+        forced-color-adjust: none;
+        transform-origin: 0 0;
+        caret-color: CanvasText;
+        z-index: 1;
+
+        --min-font-size: 1;
+        --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+        --min-font-size-inv: calc(1 / var(--min-font-size));
+      }
+
+      .textLayer :is(span, br) {
+        color: transparent;
+        position: absolute;
+        white-space: pre;
+        cursor: text;
+        transform-origin: 0% 0%;
+        user-select: text;
+      }
+
+      .textLayer > :not(.markedContent),
+      .textLayer .markedContent span:not(.markedContent) {
+        --font-height: 0;
+        --scale-x: 1;
+        --rotate: 0deg;
+        font-size: calc(var(--text-scale-factor) * var(--font-height));
+        transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+      }
+
+      .textLayer .markedContent {
+        display: contents;
+      }
+
+      /* TextLayer.render() appends this sentinel; left unstyled it is a
+         selectable block sitting on top of the page. */
+      .textLayer .endOfContent {
+        display: block;
+        position: absolute;
+        inset: 100% 0 0;
+        cursor: default;
+        user-select: none;
+      }
+
+      .textLayer.selecting .endOfContent {
+        top: 0;
+      }
+
+      .textLayer ::selection {
+        background: rgba(0, 100, 255, 0.3);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="doc-root"></div>
+    <script type="module" src="/web/doc-viewer.ts"></script>
+  </body>
+</html>

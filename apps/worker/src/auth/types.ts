@@ -1,0 +1,48 @@
+import { DAY_SECONDS, type SessionUser } from '../../shared/accounts';
+import type { EmailEnv } from '../email';
+import type { Env } from '../env';
+
+/**
+ * Auth needs a database and whatever the email engine needs; it defines neither
+ * itself. The room namespace is for one thing: telling a warm room its owner
+ * changed who may edit. POSTHOG_* is here so the funnel counters in routes.ts
+ * can call captureServer without widening to the whole worker Env.
+ */
+export type AuthEnv = EmailEnv &
+  Pick<Env['Bindings'], 'DB' | 'ANNOTATION_ROOM' | 'POSTHOG_KEY' | 'POSTHOG_HOST' | 'EMAIL_LIMITER'>;
+
+/**
+ * The same shape `/auth/me` returns, inferred from the schema both sides parse
+ * with, so the row this store reads and the object the dashboard receives cannot
+ * drift apart.
+ */
+export type User = SessionUser;
+
+/** How long a signed-in session lasts without re-authenticating. */
+export const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30;
+
+export const SESSION_COOKIE = 'ml_session';
+
+/**
+ * How stale `users.last_seen_at` may get before a resolved session refreshes it.
+ * A day is precise enough for a return-rate number and keeps an active dashboard
+ * from issuing a write per request.
+ */
+export const SEEN_BUMP_SECONDS = DAY_SECONDS;
+
+/**
+ * Deliberately permissive. The only real proof an address exists is that the
+ * link arrives, so this rejects the shapes that cannot be an address at all and
+ * leaves the rest to delivery — a stricter pattern only ever turns away real
+ * people with unusual addresses.
+ */
+export function normalizeEmail(raw: string): string | null {
+  const email = raw.trim().toLowerCase();
+  if (email.length < 3 || email.length > 254) return null;
+  const at = email.indexOf('@');
+  if (at < 1 || at !== email.lastIndexOf('@')) return null;
+  const domain = email.slice(at + 1);
+  if (!domain.includes('.') || domain.startsWith('.') || domain.endsWith('.')) return null;
+  if (/\s/.test(email)) return null;
+  return email;
+}

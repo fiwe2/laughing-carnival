@@ -1,0 +1,116 @@
+import { afterAll, afterEach, beforeEach, describe, expect, jest, test } from 'bun:test';
+import { type AnalyticsProps, setAnalytics } from './analytics';
+import { copyText, pauseToast, resumeToast, toast, toasts } from './toasts';
+
+const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
+
+const events: Array<[string, AnalyticsProps | undefined]> = [];
+
+const stubClipboard = (writeText: () => Promise<void>) =>
+  Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+
+beforeEach(() => {
+  toasts.value = [];
+  events.length = 0;
+  setAnalytics({ sink: (event, props) => events.push([event, props]), surface: 'extension' });
+});
+
+afterAll(() => {
+  setAnalytics({ sink: () => {}, surface: 'extension' });
+});
+
+describe('toast', () => {
+  test('queues a message with its type', () => {
+    toast('Saved', { type: 'success' });
+    expect(toasts.value).toEqual([{ id: expect.any(Number), message: 'Saved', type: 'success' }]);
+  });
+
+  test('defaults to an informational toast', () => {
+    toast('Heads up');
+    expect(toasts.value[0]?.type).toBe('info');
+  });
+
+  describe('timers', () => {
+    beforeEach(() => jest.useFakeTimers());
+    afterEach(() => jest.useRealTimers());
+
+    test('dismisses itself after its own duration', () => {
+      toast('Quick', { duration: 10 });
+      expect(toasts.value).toHaveLength(1);
+      jest.advanceTimersByTime(10);
+      expect(toasts.value).toEqual([]);
+    });
+
+    test('dismisses by id, so a short toast cannot take a longer one with it', () => {
+      // Removing by index would drop whichever toast happened to sit there.
+      toast('long', { duration: 400 });
+      toast('short', { duration: 10 });
+      jest.advanceTimersByTime(40);
+      expect(toasts.value.map((t) => t.message)).toEqual(['long']);
+    });
+
+    test('pausing clears the timer so the toast outlives its original duration', () => {
+      toast('hovered', { duration: 10 });
+      const id = toasts.value[0]?.id as number;
+      pauseToast(id);
+      jest.advanceTimersByTime(30);
+      expect(toasts.value).toHaveLength(1);
+    });
+
+    test('resuming picks up the remaining time rather than a fresh full duration', () => {
+      toast('hovered', { duration: 30 });
+      const id = toasts.value[0]?.id as number;
+      jest.advanceTimersByTime(20);
+      pauseToast(id);
+      jest.advanceTimersByTime(50);
+      expect(toasts.value).toHaveLength(1);
+      resumeToast(id);
+      jest.advanceTimersByTime(5);
+      expect(toasts.value).toHaveLength(1);
+      jest.advanceTimersByTime(5);
+      expect(toasts.value).toEqual([]);
+    });
+  });
+
+  test('gives every toast a distinct id, even for the same message', () => {
+    toast('same');
+    toast('same');
+    const [a, b] = toasts.value;
+    expect(a?.id).not.toBe(b?.id);
+  });
+
+  test('carries an optional action through to the queued toast', () => {
+    const onClick = () => {};
+    toast('Undo?', { action: { label: 'Undo', onClick } });
+    expect(toasts.value[0]?.action).toEqual({ label: 'Undo', onClick });
+  });
+});
+
+describe('copyText', () => {
+  test('reports success and counts the copy', async () => {
+    stubClipboard(() => Promise.resolve());
+    copyText('hello world', 'Selector copied');
+    await tick();
+
+    expect(toasts.value[0]).toMatchObject({ message: 'Selector copied', type: 'success' });
+    expect(events).toEqual([['copied', { surface: 'extension', label: 'Selector copied', chars: 11 }]]);
+  });
+
+  test('labels the copy "Copied" by default', async () => {
+    stubClipboard(() => Promise.resolve());
+    copyText('x');
+    await tick();
+    expect(toasts.value[0]?.message).toBe('Copied');
+  });
+
+  test('surfaces a rejected clipboard write instead of failing silently', async () => {
+    // The clipboard is how work leaves this product; a denied permission has to
+    // be visible, not a no-op.
+    stubClipboard(() => Promise.reject(new Error('denied')));
+    copyText('x', 'Markdown copied');
+    await tick();
+
+    expect(toasts.value[0]).toMatchObject({ message: 'Failed to copy', type: 'error' });
+    expect(events).toEqual([['copy_failed', { surface: 'extension', label: 'Markdown copied' }]]);
+  });
+});

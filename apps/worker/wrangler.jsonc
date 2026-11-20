@@ -1,0 +1,172 @@
+{
+  "name": "marklayer-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-03-01",
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true
+    }
+  },
+  "assets": {
+    "directory": "public",
+    "binding": "ASSETS",
+    // "none": an unmatched path still falls through to the Worker, which is
+    // what keeps the `proxy.all('*')` catch-all reachable.
+    "not_found_handling": "none",
+    // Only the dynamic surface runs the Worker first. Everything else — the 37
+    // prerendered marketing pages from apps/site, plus the SPA bundle — is
+    // served straight from the asset layer without a Worker invocation.
+    //
+    // This list is load-bearing: `true` would send /vs/* through Hono, where
+    // the proxy catch-all would try to fetch them as remote URLs.
+    "run_worker_first": [
+      "/", // SPA shell, plus `Accept: text/markdown` negotiation and Link headers
+      "/s/*", // shared annotation pages (injects dynamic OG tags)
+      "/p/*", // multi-page projects
+      "/og/*", // generated OG images
+      "/ws/*", // Durable Object WebSocket upgrade
+      "/api/*",
+      "/proxy",
+      "/px/*",
+      "/_r/*", // first-party PostHog relay (src/posthog-relay.ts)
+      "/robots.txt",
+      "/llms.txt",
+      "/llms-full.txt",
+      "/.well-known/*",
+      "/f", // anonymous PDF upload — `/f/*` does not match the bare path
+      "/f/*", // and retrieval of one
+      "/auth/*", // magic-link sign-in
+      "/app", // dashboard shell (app.html)
+      "/app/*", // and its client-routed sub-paths, which have no asset of their own
+      "/integrations/*" // the Slack app's OAuth and Events endpoints
+    ]
+  },
+  // Secrets, set with `wrangler secret put <NAME>` — deliberately not `vars`,
+  // and never checked in. Listed here because their absence is silent:
+  //
+  //   POSTHOG_KEY   The MarkLayer project's ingest key. Without it
+  //                 captureServer() disables itself (src/posthog.ts) and every
+  //                 server-side event is dropped. This was unset in production
+  //                 until August 2026, so `annotation_session_ended` and
+  //                 `proxy_render_failed` never recorded a single event while
+  //                 client-side telemetry looked healthy. Verify a deploy by
+  //                 checking the PostHog event list, not the code.
+  //   POSTHOG_HOST  Optional. Defaults to https://us.i.posthog.com. Also the
+  //                 upstream of the browser's /_r relay.
+  //   SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, SLACK_SIGNING_SECRET
+  //                 The two-way Slack app's credentials (docs/slack-app.md).
+  //   SLACK_TOKEN_KEY
+  //                 Base64 of 32 random bytes (`openssl rand -base64 32`): the
+  //                 AES-GCM key bot tokens are sealed under in D1. Rotating it
+  //                 orphans every install. Any of the four unset turns the
+  //                 Slack app off and hides it in the UI.
+  // Voice-note transcripts: POST /f/:id/transcribe runs whisper-large-v3-turbo.
+  "ai": { "binding": "AI" },
+  // Caps /f/:id/transcribe per client IP (keyed by cf-connecting-ip). 10 calls a minute per
+  // Cloudflare location; `namespace_id` only has to be unique within the account.
+  // https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
+  "ratelimits": [
+    {
+      "name": "TRANSCRIBE_LIMITER",
+      "namespace_id": "4271",
+      "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      // Sign-in and invite mail per client IP. Cloudflare advises against IP keys
+      // (shared NATs), but these routes are signed out, so there is no better one.
+      "name": "EMAIL_LIMITER",
+      "namespace_id": "4272",
+      "simple": { "limit": 5, "period": 60 }
+    },
+    {
+      // Anonymous POST /f per client IP: screenshots, voice and video notes.
+      "name": "UPLOAD_LIMITER",
+      "namespace_id": "4273",
+      "simple": { "limit": 30, "period": 60 }
+    },
+    {
+      // Top-level page fetches and renders per client IP: GET /proxy, /s/:id/page.json and an
+      // uncached /og/page.png. A viewer fetches one page per navigation; /px/* assets are not counted.
+      "name": "FETCH_LIMITER",
+      "namespace_id": "4274",
+      "simple": { "limit": 60, "period": 60 }
+    },
+    {
+      // Anonymous room traffic per client IP: share API writes, /s/:id/mcp calls and /ws opens.
+      // Sized for an agent working a queue of comments; autosave posts at most every 3s per tab.
+      "name": "ROOM_LIMITER",
+      "namespace_id": "4275",
+      "simple": { "limit": 120, "period": 60 }
+    },
+    {
+      // /px/* sub-resources fetched through the paid fixed-IP relay, per client IP, on a cache
+      // miss only. One challenged page can miss on a few hundred assets before the colo cache fills.
+      "name": "RELAY_LIMITER",
+      "namespace_id": "4276",
+      "simple": { "limit": 300, "period": 60 }
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      // "marklayer" here is the desired name; Cloudflare's registered name for
+      // this DB is still "annotateweb" (pre-rename), and `--remote` commands
+      // must say that instead — see migrations/ below and CLAUDE.md.
+      "database_name": "marklayer",
+      "database_id": "b19c956e-8602-439b-9c06-242e88da8fbb",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ANNOTATION_ROOM",
+        "class_name": "AnnotationRoom"
+      }
+    ]
+  },
+  "r2_buckets": [
+    {
+      "binding": "OG_BUCKET",
+      "bucket_name": "marklayer-og"
+    },
+    {
+      // Uploaded PDFs. Kept separate from OG_BUCKET on purpose: that one is a
+      // regenerable cache the cron can evict freely, this one holds the only
+      // copy of a user's file until its own retention window clears it.
+      "binding": "FILE_BUCKET",
+      "bucket_name": "marklayer-files"
+    }
+  ],
+  // Cloudflare Email Service. Unrestricted on purpose — a magic link goes to
+  // whatever address someone typed, so an `allowed_destination_addresses` list
+  // would only work for the team. Needs the sending domain onboarded (Compute >
+  // Email Service > Email Sending) and a Workers Paid plan; without both, only
+  // verified destination addresses on the account can receive anything.
+  "send_email": [{ "name": "EMAIL" }],
+  "vars": {
+    "MAIL_FROM": "login@marklayer.app",
+    // Where outbound links and the OG base point. Production's; a local run sets
+    // APP_ORIGIN=http://localhost:5173 in .dev.vars, which overrides this.
+    "APP_ORIGIN": "https://marklayer.app"
+    // MAIL_PROVIDER ("cloudflare" | "resend" | "console") pins the mailer and is
+    // deliberately unset: with no pin, `mailerFor` takes the EMAIL binding above,
+    // and a dev run with no binding falls to the console so the link prints in
+    // the terminal. To move off Cloudflare: `wrangler secret put RESEND_API_KEY`,
+    // add "MAIL_PROVIDER": "resend" here, deploy. A pin that names a provider
+    // with nothing configured throws rather than quietly logging the link.
+  },
+  "triggers": {
+    // Hourly: reset the landing page's public demo board. 03:00: the retention
+    // sweep as well (index.ts keys off the expression, so keep them in sync).
+    "crons": ["0 * * * *", "0 3 * * *"]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["AnnotationRoom"]
+    }
+  ]
+}

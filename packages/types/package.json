@@ -1,0 +1,53 @@
+{
+  "name": "@marklayer/types",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    "./ops": {
+      "types": "./src/ops.ts",
+      "default": "./src/ops.ts"
+    },
+    "./wire": {
+      "types": "./src/wire.ts",
+      "default": "./src/wire.ts"
+    },
+    "./net": {
+      "types": "./src/net.ts",
+      "default": "./src/net.ts"
+    },
+    "./http": {
+      "types": "./src/http.ts",
+      "default": "./src/http.ts"
+    },
+    "./agents": {
+      "types": "./src/agents.ts",
+      "default": "./src/agents.ts"
+    },
+    "./tools": {
+      "types": "./src/tools.ts",
+      "default": "./src/tools.ts"
+    },
+    "./uploads": {
+      "types": "./src/uploads.ts",
+      "default": "./src/uploads.ts"
+    },
+    "./relay": {
+      "types": "./src/relay.ts",
+      "default": "./src/relay.ts"
+    }
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@marklayer/brand": "workspace:*",
+    "zod": "^4.5.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "typescript": "^7.0.2"
+  }
+}

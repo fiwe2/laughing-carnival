@@ -1,0 +1,206 @@
+import {
+  type AreaDraft,
+  AreaPopover,
+  areaOpFrom,
+  type DraftAreaState,
+  type DraftRect,
+  rectFromDraft,
+} from '@ext/components/AreaLayer';
+import { injectDragSurface } from '@ext/lib/dom';
+import { color } from '@ext/lib/prefs';
+import { constrainEnd, hexToRgba } from '@ext/lib/renderer';
+import { scrollOffset } from '@ext/lib/scroller';
+import { activeTool } from '@ext/lib/tool-state';
+import { useSignal, useSignalEffect } from '@preact/signals';
+import { createPortal } from 'preact/compat';
+import { useRef } from 'preact/hooks';
+import { tinykeys } from 'tinykeys';
+import { capture } from './analytics';
+import { captureAnchors, frameViewport, isElementNode, sameOriginWindow, useIframeOverlay } from './iframeOverlay';
+import { cssScale, iframeScrollY, pushDeviceOp } from './viewer-state';
+
+/** Pointer position in the framed page's document space. */
+const docPoint = (win: Window, e: PointerEvent) => {
+  const o = scrollOffset(win);
+  return { x: e.clientX + o.x, y: e.clientY + o.y };
+};
+
+export function WebAreaLayer({ frameRef }: { frameRef: { current: HTMLIFrameElement | null } }) {
+  const draft = useSignal<DraftAreaState | null>(null);
+  const pending = useSignal<DraftRect | null>(null);
+  const lastRaw = useRef<{ x: number; y: number } | null>(null);
+  const shiftHeld = useRef(false);
+
+  const applyConstraint = () => {
+    const d = draft.value;
+    const raw = lastRaw.current;
+    if (!d || !raw) return;
+    const { x, y } = shiftHeld.current ? constrainEnd('rectangle', d.startDocX, d.startDocY, raw.x, raw.y) : raw;
+    draft.value = { ...d, curDocX: x, curDocY: y };
+  };
+
+  useIframeOverlay(frameRef, ({ win, doc }) => {
+    const onPointerDown = (e: PointerEvent) => {
+      if (activeTool.value !== 'area' || pending.value) return;
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const { x: dx, y: dy } = docPoint(win, e);
+      lastRaw.current = { x: dx, y: dy };
+      shiftHeld.current = e.shiftKey;
+      draft.value = { startDocX: dx, startDocY: dy, curDocX: dx, curDocY: dy };
+      const target = isElementNode(e.target) ? e.target : doc.documentElement;
+      try {
+        target.setPointerCapture?.(e.pointerId);
+      } catch {
+        /* capture is best-effort */
+      }
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      const d = draft.value;
+      if (!d) return;
+      e.preventDefault();
+      lastRaw.current = docPoint(win, e);
+      shiftHeld.current = e.shiftKey;
+      applyConstraint();
+    };
+
+    const onPointerUp = (e: PointerEvent) => {
+      const d = draft.value;
+      if (!d) return;
+      e.preventDefault();
+      e.stopPropagation();
+      shiftHeld.current = e.shiftKey;
+      lastRaw.current = docPoint(win, e);
+      const { x, y } = shiftHeld.current
+        ? constrainEnd('rectangle', d.startDocX, d.startDocY, lastRaw.current.x, lastRaw.current.y)
+        : lastRaw.current;
+      const r = rectFromDraft({ ...d, curDocX: x, curDocY: y });
+      draft.value = null;
+      if (r.w < 6 || r.h < 6) return;
+      pending.value = r;
+    };
+
+    const onClick = (e: MouseEvent) => {
+      if (activeTool.value !== 'area') return;
+      e.preventDefault();
+      e.stopPropagation();
+    };
+
+    // Keys in the frame reach the host window as `ml-key`, so this hears Shift from either side.
+    const setShift = (next: boolean) => {
+      if (shiftHeld.current === next) return;
+      shiftHeld.current = next;
+      if (draft.value) applyConstraint();
+    };
+    const unbindShiftDown = tinykeys(window, { Shift: () => setShift(true) });
+    const unbindShiftUp = tinykeys(window, { Shift: () => setShift(false) }, { event: 'keyup' });
+
+    win.addEventListener('pointerdown', onPointerDown, true);
+    win.addEventListener('pointermove', onPointerMove, true);
+    win.addEventListener('pointerup', onPointerUp, true);
+    win.addEventListener('pointercancel', onPointerUp, true);
+    win.addEventListener('click', onClick, true);
+    return () => {
+      try {
+        win.removeEventListener('pointerdown', onPointerDown, true);
+        win.removeEventListener('pointermove', onPointerMove, true);
+        win.removeEventListener('pointerup', onPointerUp, true);
+        win.removeEventListener('pointercancel', onPointerUp, true);
+        win.removeEventListener('click', onClick, true);
+      } catch {
+        /* iframe may have navigated cross-origin */
+      }
+      unbindShiftDown();
+      unbindShiftUp();
+    };
+  });
+
+  useSignalEffect(() => {
+    if (activeTool.value !== 'area') {
+      draft.value = null;
+      pending.value = null;
+    }
+  });
+
+  useSignalEffect(() => {
+    if (activeTool.value !== 'area') return;
+    return injectDragSurface(frameRef.current?.contentDocument);
+  });
+
+  // Subscribe to iframeScrollY so the preview repositions while the user holds-and-drags
+  // past the iframe edge (autoscroll) or scrolls between draft start and commit.
+  iframeScrollY.value;
+
+  if (activeTool.value !== 'area') return null;
+
+  const draftRect = draft.value ? rectFromDraft(draft.value) : pending.value;
+  const frame = frameRef.current;
+
+  const toHostViewport = (r: DraftRect | null) => {
+    if (!r || !frame) return null;
+    const fr = frame.getBoundingClientRect();
+    const win = sameOriginWindow(frame);
+    const { x: sx, y: sy } = win ? scrollOffset(win) : { x: 0, y: iframeScrollY.value };
+    const s = cssScale.value;
+    return { x: fr.left + (r.x - sx) * s, y: fr.top + (r.y - sy) * s, w: r.w * s, h: r.h * s };
+  };
+
+  const hostRect = toHostViewport(draftRect);
+
+  const commit = (draft: AreaDraft) => {
+    const { comment, priority, mentions } = draft;
+    const r = pending.value;
+    if (!r) return;
+    // Hit-test the rect's centre, but anchor to its top-left.
+    const anchors = captureAnchors({
+      frame: frameRef.current,
+      x: r.x + r.w / 2,
+      y: r.y + r.h / 2,
+      anchor: { x: r.x, y: r.y },
+    });
+    const op = areaOpFrom({ rect: r, draft, anchors, captureViewport: frameViewport(frameRef.current) });
+    pushDeviceOp(op);
+    capture('area_committed', {
+      has_note: Boolean(comment),
+      has_priority: Boolean(priority),
+      mentions: mentions?.length ?? 0,
+      markup_strokes: 0,
+      width: Math.round(r.w),
+      height: Math.round(r.h),
+    });
+    pending.value = null;
+  };
+
+  const cancel = () => {
+    capture('area_cancelled', { markup_strokes: 0 });
+    pending.value = null;
+  };
+
+  return createPortal(
+    <>
+      {hostRect && (
+        <div
+          class="fixed pointer-events-none rounded-[3px] z-2147483646"
+          style={{
+            left: hostRect.x,
+            top: hostRect.y,
+            width: hostRect.w,
+            height: hostRect.h,
+            background: hexToRgba(color.value, 0.12),
+            boxShadow: `inset 0 0 0 1.5px ${color.value}`,
+          }}
+        />
+      )}
+      {pending.value && hostRect && (
+        <AreaPopover
+          rect={{ x: hostRect.x, y: hostRect.y, w: hostRect.w, h: hostRect.h }}
+          onCommit={commit}
+          onCancel={cancel}
+        />
+      )}
+    </>,
+    document.body,
+  );
+}

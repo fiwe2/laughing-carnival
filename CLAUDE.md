@@ -1,0 +1,157 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project
+
+MarkLayer — free annotation/collaboration tool for any webpage. Monorepo with a Chrome extension, a Cloudflare Worker backend + web app, a static Astro marketing/SEO site, and an MCP server that bridges annotations to AI coding agents.
+
+## Commands
+
+```bash
+bun install          # First-time setup (runs wxt prepare for extension)
+bun run dev          # All apps dev mode (Turbo)
+bun run build        # Build all
+bun run check        # Type-check all (per-workspace `tsc --noEmit`; `astro check` in apps/site)
+bun run lint         # Biome lint + format check
+bun run lint:fix     # Biome auto-fix
+
+# Releases — run locally; CI only lints, type-checks and builds, except `release-mcp.yml`, which publishes marklayer-mcp to npm on push to main.
+bun run deploy         # Build + deploy worker to Cloudflare (site is embedded in it)
+bun run deploy:mcp     # Publish marklayer-mcp to npm, but only if its version is ahead
+bun run deploy:site    # Deploy apps/site standalone to Cloudflare Pages
+cd apps/site && bun run indexnow:submit   # After a deploy that changed pages: ping IndexNow (Bing, Yandex, …)
+bun run zip:extension  # Build Chrome + Firefox store zips into apps/extension/.output
+
+# Extension only
+cd apps/extension && bun dev               # Chrome (MV3) dev
+cd apps/extension && bun dev:firefox       # Firefox dev
+cd apps/extension && bun build             # Chrome build
+cd apps/extension && bun build:firefox     # Firefox build
+cd apps/extension && bun zip               # Package Chrome zip for store upload
+cd apps/extension && bun run zip:all       # Chrome + Firefox zips (what `zip:extension` runs)
+
+# Worker only
+cd apps/worker && bun dev          # Vite + Wrangler together
+cd apps/worker && bun run build    # vite build, then `embed:site` copies apps/site/dist into public/client
+cd apps/worker && bun run deploy   # Build + `wrangler deploy`
+
+# D1 schema changes — write a new file in apps/worker/migrations/, then:
+cd apps/worker && bunx wrangler d1 migrations apply marklayer --local   # dev DB
+cd apps/worker && bunx wrangler d1 migrations apply marklayer --remote  # prod — `migrations` subcommands
+                                                                         # resolve via wrangler.jsonc's
+                                                                         # database_name, unlike `d1 execute`
+                                                                         # (see below), so "marklayer" is right here
+
+# Marketing site only
+cd apps/site && bun dev            # astro dev
+cd apps/site && bun run build      # astro build → dist/
+cd apps/site && bun run check      # astro check (this workspace's `check`, not tsc)
+
+# Fetch relay only (see apps/fetcher/README.md for hosting)
+cd apps/fetcher && bun run dev      # Local relay on :8080 (needs FETCHER_TOKEN)
+cd apps/fetcher && bun run build    # → dist/server.js, dependency-free single file
+docker build -f apps/fetcher/Dockerfile -t marklayer-fetcher .   # from the repo root
+
+# MCP server only (published to npm as `marklayer-mcp`)
+cd apps/mcp && bun run build       # Compile TS → dist/cli.js
+cd apps/mcp && bun run dev         # tsc --watch
+cd apps/mcp && node scripts/publish-if-new.mjs --check   # Publish preflight, no side effects
+```
+
+`bun run test` runs `bun test` in the workspaces that have specs (`packages/types`, `packages/agent-tools`, `packages/brand`, `packages/ui`, `packages/emails`, `apps/extension`, `apps/worker`, `apps/mcp`, `apps/fetcher`, `apps/site`); the rest of the monorepo has none, so `bun run check` (TypeScript) and `bun run lint` (Biome) still carry most of the verification loop. Prefer a test where the failure would be silent — a truncated stream, a guard that stops guarding — over one that restates the type signature.
+
+**`apps/site` is pinned to `typescript@^6`, deliberately.** Its `check` is `astro check`, which needs the TS programmatic API that the 7.x native compiler does not ship yet (withastro/roadmap#1321). The rest of the monorepo runs `tsc --noEmit` on 7.x and is unaffected. Do not bump the site to 7 until `astro check` supports it: the alternative, swapping it for `tsc --noEmit`, silently stops type-checking all 37 `.astro` templates.
+
+## Structure
+
+```
+apps/extension/     # Chrome/Firefox extension (WXT + Preact)
+  components/       # Canvas, Toolbar, all annotation Layer components
+  lib/              # The kernel both hosts share, one concern per module: ops.ts (the op
+                    # list), tool-state.ts, ui-state.ts, room-id.ts, realtime.ts (room
+                    # transport), host-config.ts + host.ts (what a host injects),
+                    # keymap.ts, tools.ts, renderer.ts, selector.ts, anchor.ts, scroller.ts,
+                    # share.ts (REST + uploads), portal.ts (Base UI target in the shadow root)
+apps/worker/        # CF Worker API + web app (Hono + Vite + Preact)
+  src/              # index.ts (mounts the route files: share-pages, og-routes, upload-routes,
+                    # agent-surface, integrations/routes), api.ts (OpenAPI share API),
+                    # annotation-room.ts (Durable Object, sole room writer; its RPC shape
+                    # is room-stub.ts), lock/gate.ts (`openRoom`, the one door), rooms-
+                    # lifecycle.ts, store.ts (D1), proxy/ (fetch, relay, rewrite, inject),
+                    # og*.ts (cards), mcp.ts (/s/:id/mcp), cron.ts
+  shared/           # What src/ and web/ both read: frame-protocol, proxy-errors, demo-room
+  web/              # Web app UI: Viewer + viewer/* hooks, viewer-state.ts, ui-state.ts,
+                    # viewer-actions.ts, host.ts (webHost), boot.ts, Landing, Web* layers
+  migrations/       # D1 schema, as ordered `wrangler d1 migrations` files
+  wrangler.jsonc    # Worker bindings (D1, DO, R2) + `assets.run_worker_first`
+apps/site/          # Astro static marketing/SEO site (marklayer.app content pages)
+  src/content/      # Markdown collections: compare/, alternatives/, use-cases/
+  src/content.config.ts  # Zod frontmatter schemas for those collections
+  src/pages/        # Hubs (compare, alternatives, use-cases, pricing, about,
+                    # privacy) + programmatic routes /vs/[slug], /alternatives/[slug],
+                    # /for/[slug], plus sitemap.xml.ts and pricing.md.ts
+  src/lib/          # site.ts (constants), collections.ts (ordered reads),
+                    # schema.ts (JSON-LD), markdown.ts, docs-nav.ts (sidebar,
+                    # ⌘K search and pager, one read of the collections),
+                    # outline.ts (heading ids + the on-this-page column)
+  public/_headers   # HSTS + font rules; per-route Cache-Control is appended at build
+  src/data/routes.json  # Every served path: drives dist/_headers and the :5173 dev proxy
+apps/mcp/           # MCP server (`marklayer-mcp` on npm) — exposes annotation
+                    # rooms as tools (watch/acknowledge/resolve/reply) for AI agents.
+                    # server.json is the MCP registry manifest (keep its version
+                    # in sync with package.json).
+apps/fetcher/       # Fixed-IP relay the worker's proxy falls back to when a host
+                    # blocks Cloudflare's shared egress. One endpoint, bearer-token
+                    # auth, resolve-time SSRF guard. Builds to a dependency-free 3KB
+                    # bundle, so the host is swappable (deploy/ holds a fly.toml and
+                    # a systemd unit). See its README.
+packages/types/     # Shared types & Zod schemas (DrawOp union incl. guide/inspect,
+                    # CommentOp + priority/status, Peer, AnchorPoint, target element
+                    # metadata) and the `cn` helper. Single source of truth for
+                    # client + server validation.
+packages/agent-tools/  # The agent tool contract with no transport in it: the MCP
+                    # tool specs, their zod/mini input schemas, the agent-facing
+                    # projection of an annotation and the ok/err envelope. Lifted
+                    # out of apps/mcp so a second runtime can serve the same tools:
+                    # the worker's /s/:id/mcp (Streamable HTTP, src/mcp.ts) does.
+                    # Deliberately imports no MCP SDK — the contract is shared,
+                    # the wiring is not.
+packages/brand/     # Product constants and links (ORIGIN, share/upload paths, displayHost)
+packages/ui/        # Shared UI primitives (`cn`)
+packages/tokens/    # Design tokens the three stylesheets read
+```
+
+## Conventions
+
+- **Preact, not React** — use `preact/hooks`, `@preact/signals`. Vite aliases `react` and `react-dom` to `preact/compat` (worker) and WXT's preact preset handles the extension. Both tsconfigs carry matching `paths` entries so `@base-ui/react` types resolve.
+- **Base UI for interactive primitives** — popovers, menus, dialogs and tooltips come from `@base-ui/react` (used by `Tooltip`, `ContextMenu`, `SettingsPanel`, `ShareDialog`, `ProjectTabs`, `DeviceMenu`); don't hand-roll replacements. In the extension, portalled parts must render into `portalContainer` from `lib/portal.ts` — the UI lives in a shadow root, so a default `document.body` portal escapes the injected stylesheet. The web app leaves that signal `null` and takes Base UI's default.
+- **Type comes from the scale, never from a bracket** — font size, letter-spacing and line-height are named steps in the app's `@theme` (`--text-*`, `--tracking-*`, `--leading-*` in `apps/worker/web/style.css`, `apps/extension/entrypoints/content/style.css` and `apps/site/src/styles/global.css`). Write `text-ui`, not `text-[13px]`; `tracking-ui`, not `tracking-[-0.01em]`; `leading-body`, not `leading-[1.55]`. The same holds for colour: `text-ml-accent-fg`, not `text-[oklch(0.86_0.08_300)]`. Before this the product ran fourteen hand-picked pixel sizes with no relationship between them, which is how two copies of the same "Desktop only" screen shipped at 24/15 and 22/16 without anyone seeing it. If a design genuinely needs a step the ladder does not have, add it to `@theme` with a comment saying what it is for — and mirror it in the extension's stylesheet too, because the same components compile into both and a token missing from one silently renders at the browser default. Two deliberate exceptions, both already commented where they live: the URL field on the landing page keeps Tailwind's 16px `text-base` (iOS Safari zooms a focused input below 16px), and `code` in `apps/site` sets `font-size: 0.85em` as plain CSS because it is relative to whatever it sits in.
+- **Arbitrary values are still right for one-off layout** — `max-w-[760px]`, `grid-cols-[8.5rem_1fr]`, `z-[2147483647]`, `animate-[fadeIn_140ms_ease-out]` are positions and geometry, not design decisions with a scale behind them. The rule above is about tokens that repeat; a number used once, in one place, to make one box the right size does not need a name.
+- **Single quotes, always semicolons** — enforced by Biome (line width 120, 2-space indent). Biome does not parse `.astro` files (`!**/*.astro` in `biome.json`), so match the surrounding style by hand in `apps/site`.
+- **No `any`** — `noExplicitAny: error` in Biome.
+- **Two or more parameters → take a single object** — a function that needs more than one input takes one named-field object (`createDraftStore({ key, debounceMs })`, not `createDraftStore(key, debounceMs)`). Call sites stay readable without jumping to the signature, argument order stops mattering, and adding or defaulting a field is not a breaking change at every caller. Applies to new and refactored functions; the existing positional signatures are not a mass-rename mandate — convert one when you're already changing it. Exceptions: an inseparable pair that is really one value (`(x, y)`), and any signature dictated by an external API (event handlers, `Array.prototype` callbacks, Hono/WXT/Base UI hooks).
+- **Keep comments concise, precise, and non-obvious** — one or two lines, explaining *why*, never restating what the code does. Don't comment code whose behavior is already clear from the name and structure (`// increment counter` above `count++` is noise, delete it). If a comment needs a paragraph, fix the name or the code instead. No banner headings, no commented-out code, no change logs (that belongs in the commit message). A genuinely non-obvious constraint — a spec quirk, a browser bug, a deliberate tradeoff — can run longer; that's the exception, not the default.
+- **No `as` casts, no `!`** — a type assertion silences the checker without proving anything, and a non-null assertion is the same move applied to `null`. Fix the upstream type, narrow with a runtime guard (`instanceof`, `typeof`, `in`), destructure with a typed iteration, or parse with Zod. `as const` is fine — it narrows, it doesn't assert. The one exception is DOM interop where the platform types are genuinely wider than reality (`cloneNode` returning `Node`, `getRootNode()`, a vendor-prefixed property): keep it to a single line at the boundary with a comment saying why. `!` has no exception — use a guard, `?.`, or `??`. Neither is machine-enforced today: Biome's `noNonNullAssertion` is deliberately `off` because ~13 pre-existing assertions still need cleaning up, and Biome has no rule for `as` at all. Don't add new ones.
+- **Prefer signals over `useEffect`** — derive shared state with `useSignalEffect` / `useComputed`; reach for `useEffect` only when integrating with non-signal-aware APIs.
+- **Keyboard handling uses `tinykeys`** (already a dep) — not raw `addEventListener('keydown')`. Pair a keydown + a `{ event: 'keyup' }` call to track held modifiers (Alt, Shift). Keys pressed in the frame are replayed on the host as `ml-key`, so iframe-scoped tools bind on `window` alone; binding on the iframe `win` too fires them twice.
+- **Cloudflare only** for infra — D1, Durable Objects, R2, Workers.
+- Worker imports extension components via `@ext/*` path alias (`apps/worker → apps/extension`).
+- State management uses Preact Signals (not `useState` for shared state). Shared state lives in the `apps/extension/lib/*-state.ts` / `ops.ts` / `room-id.ts` modules by concern; web-only state in `apps/worker/web/viewer-state.ts` and `ui-state.ts`.
+- Zod schemas in `packages/types` are the source of truth — derive TS types via `z.infer`, parse all wire data.
+- **Always import from `zod/mini`, never `zod`** — Mini is tree-shakable and meaningfully smaller in the extension content script and Worker bundles we ship. Use the functional API: `z.optional(s)`, `z.nullable(s)`, `s.check(z.minLength(1), z.int(), z.gte(1), z.lte(600))`, `z.enum([...])`, `z.discriminatedUnion(...)`, `z.record(z.string(), z.unknown())`. Do not introduce the classic chained API (`s.min(1)`, `s.optional()`, `s.email()`) — it pulls in the full builder and defeats the savings. `safeParse` and `z.infer` work unchanged. Two deliberate exceptions, both outside shipped client bundles: `apps/worker/src/api.ts` uses the `z` re-exported by `@hono/zod-openapi` (needed for spec generation), and `apps/site` uses `astro/zod` for content frontmatter.
+- IDs generated with `nanoid`.
+
+## Architecture Notes
+
+- **Subsystem notes** live next to the code: `apps/worker/CLAUDE.md` (proxy fallback, OG cards, landing demo, D1 migrations) and `apps/site/CLAUDE.md` (marketing pages).
+- **Real-time sync**: clients connect via WebSocket to a per-room Durable Object (`AnnotationRoom` in `apps/worker/src/annotation-room.ts`). It is the only writer of a room: sockets, REST saves, MCP and Slack all go through its `mutate`, and it broadcasts to peers and flushes to D1. A bare-array REST save (what old extensions send) only adds ops; the object form replaces.
+- **Voice/video**: peer-to-peer WebRTC negotiated through the same DO (`apps/worker/web/useVoiceRoom.ts`); TURN fallback configured.
+- **Iframe proxy**: the worker fetches the target URL and strips frame-blocking headers (`X-Frame-Options`, CSP) so it can be embedded. SSRF guard blocks private/loopback hosts (`isBlockedHost` in `packages/types`, shared with the relay).
+- **Canvas overlay**: a transparent Preact root is injected over the iframe (extension) or the proxied page (web). Each tool is a sibling Layer component (`Canvas`, `CommentLayer`, `AreaLayer`, `GuideLayer`, `InspectorLayer`, `InspectorMarkerLayer`, `MeasureLayer`, `MultiInspectLayer`, `QuickGrabLayer`, `SelectionLayer`, `TextLayer`); web versions live in `apps/worker/web/Web*.tsx`.
+- **Everything is an op**: ruler guides included — they ride the same persisted, peer-synced op stream (`guideOpSchema` in the `DrawOp` union), with `guides` derived as a computed view over `operations` rather than kept in separate state. Comments carry `status` and `priority` on the same op.
+- **Anchoring**: annotations bind to host-page elements via `lib/anchor.ts` + `lib/selector.ts` (CSS selector + text-fingerprint fallback for SPAs). Selectors re-resolve on host-page mutations via a MutationObserver tick signal; DPR-aware scale capture preserves layout across viewport changes.
+- **Public share API**: `apps/worker/src/api.ts` mounts an `OpenAPIHono` at `/api` — anonymous by design (the id you POST *is* the access token), with a lazily built, memoized spec at `/api/openapi.json`.
+- **Agent-facing surface**: the worker serves `llms.txt`, `llms-full.txt`, `/.well-known/api-catalog`, `security.txt`, an agent-skill `SKILL.md` + index, and an MCP server card, served by `src/agent-surface.ts` from `apps/site/src/content/agent/*` and `apps/site/src/lib/agent.ts`.
+- **MCP integration**: annotation rooms are MCP tools (`marklayer_watch_annotations`, `acknowledge`, `resolve`, `reply`, …) so an agent can poll a room and act on comments while the human sees live status. Two transports, one contract (`packages/agent-tools`): every share link answers Streamable HTTP at `/s/:id/mcp` with nothing installed, and `apps/mcp` is the stdio package for clients that only run local servers. The well-known server card's tool list is pinned to that contract by `apps/worker/src/server-card.test.ts`.
+- **Cleanup**: daily cron (3 AM UTC, configured in `wrangler.jsonc`) deletes annotations 90 days after their last access, plus any past an explicit `expires_at` or `owner_expires_at`.

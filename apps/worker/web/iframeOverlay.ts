@@ -1,0 +1,299 @@
+import { type AnchorDelta, applyAnchorDelta } from '@ext/lib/anchor';
+import { clearMarkPointer, setMarkPointer } from '@ext/lib/mark-hover';
+import { scrollOffset } from '@ext/lib/scroller';
+import { captureTarget, pickElementAtPoint } from '@ext/lib/selector';
+import type { CaptureViewport, PageAnchor, Point, TargetElement } from '@marklayer/types/ops';
+import { useSignalEffect } from '@preact/signals';
+import { useEffect, useRef } from 'preact/hooks';
+import { capturePageAnchor, isPagedDocument, resolvePageAnchor } from './docAnchor';
+import { cssScale, frameRect, iframeScrollY } from './viewer-state';
+
+// Cross-realm: iframe DOM nodes are instances of the iframe's Element, not the host's,
+// so `e.target instanceof Element` always returns false. Check nodeType instead.
+export function isElementNode(v: EventTarget | null): v is Element {
+  return v !== null && 'nodeType' in v && v.nodeType === 1;
+}
+
+/** Translate an iframe-local element rect to host viewport coords (accounts for cssScale). */
+export function toViewportRect(frame: HTMLIFrameElement, el: Element): DOMRect {
+  const fr = frame.getBoundingClientRect();
+  const r = el.getBoundingClientRect();
+  const s = cssScale.value;
+  return new DOMRect(fr.left + r.left * s, fr.top + r.top * s, r.width * s, r.height * s);
+}
+
+/**
+ * The framed page's window, or null once the page has navigated out of the proxy:
+ * the frame is cross-origin from then on, and touching its window throws.
+ */
+export function sameOriginWindow(frame: HTMLIFrameElement | null): Window | null {
+  return frame?.contentDocument ? frame.contentWindow : null;
+}
+
+/**
+ * The viewport an annotation was captured in. That is the framed page's own
+ * viewport, not the host window's — the host chrome and the CSS zoom are ours,
+ * not the annotated page's, so recording them would misdescribe the capture.
+ */
+export function frameViewport(frame: HTMLIFrameElement | null): CaptureViewport {
+  const { innerWidth: width, innerHeight: height } = sameOriginWindow(frame) ?? window;
+  return { width, height };
+}
+
+/**
+ * Which side a marker's hover card opens on. Bounded by the frame, not the window: marker layers
+ * clip to it, and a scaled-down page (a PDF) is narrower. Fitting neither way, it takes the roomier side.
+ */
+export function cardFlip({ x, y, reach }: { x: number; y: number; reach: Point }) {
+  const cs = cssScale.value;
+  const f = frameRect.value ?? { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+  const right = Math.min(f.width, window.innerWidth - f.left);
+  const bottom = Math.min(f.height, window.innerHeight - f.top);
+  const px = x * cs;
+  const py = y * cs;
+  return {
+    flipH: px + reach.x * cs > right && px - Math.max(0, -f.left) > right - px,
+    flipV: py + reach.y * cs > bottom && py - Math.max(0, -f.top) > bottom - py,
+  };
+}
+
+/**
+ * A point in the framed page's document space. `anchor` defaults to that same
+ * point; pass it when the op's anchor differs from the point worth hit-testing
+ * (an area rect is picked at its centre but anchored to its top-left).
+ */
+interface FramePoint {
+  frame: HTMLIFrameElement | null;
+  x: number;
+  y: number;
+  anchor?: Point;
+}
+
+/** Bind the point to the element under it, so the op re-anchors on reflow. */
+function pickFrameTarget({ frame, x, y, anchor }: FramePoint): TargetElement | undefined {
+  const win = frame?.contentWindow;
+  const doc = frame?.contentDocument;
+  if (!win || !doc) return undefined;
+  const o = scrollOffset(win);
+  const el = pickElementAtPoint(x - o.x, y - o.y, doc);
+  return el ? captureTarget({ el, anchor: anchor ?? { x, y } }) : undefined;
+}
+
+/**
+ * Both anchor kinds for one point. A PDF or an image has no element worth
+ * binding to and an ordinary page has no page number, so exactly one of these is
+ * ever present — spread it into the op and a tool never has to know which kind
+ * of document it is drawing on.
+ */
+export function captureAnchors({ frame, x, y, anchor }: FramePoint): { target?: TargetElement; pdf?: PageAnchor } {
+  if (isPagedDocument(frame?.contentDocument)) {
+    return { pdf: capturePageAnchor({ frame, ...(anchor ?? { x, y }) }) };
+  }
+  return { target: pickFrameTarget({ frame, x, y, anchor }) };
+}
+
+/**
+ * Mirror of `captureAnchors` for the render side. A page's box is the whole
+ * anchor, so there is no drift to measure against the stored point the way the
+ * element strategies do — a page either exists at this number or it does not.
+ */
+export function resolveAnchors({
+  target,
+  pdf,
+  docX,
+  docY,
+  doc,
+}: {
+  target?: TargetElement;
+  pdf?: PageAnchor;
+  docX: number;
+  docY: number;
+  doc: Document;
+}): Pick<AnchorDelta, 'x' | 'y' | 'strategy'> {
+  if (pdf) {
+    const p = resolvePageAnchor({ doc, anchor: pdf });
+    if (p) return { x: p.x, y: p.y, strategy: 'page' };
+  }
+  return applyAnchorDelta(target, { docX, docY }, { doc, win: doc.defaultView ?? undefined });
+}
+
+export function rectsEqual(a: DOMRectReadOnly, b: DOMRectReadOnly): boolean {
+  return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
+}
+
+/**
+ * Feeds `markPointer` in the framed page's client space. Over the page the frame
+ * reports it directly; over our own chrome (an open hover card) the host does,
+ * unscaled back out of the frame's box, so a card covering its text stays open.
+ */
+export function useFrameMarkPointer(frameRef: { current: HTMLIFrameElement | null }) {
+  // A card opening under the pointer is itself a leave from the frame, so the clear
+  // is deferred and the pointer arriving on the host (on that card) cancels it.
+  const leaveTimer = useRef(0);
+  useIframeOverlay(frameRef, ({ win, doc }) => {
+    const onMove = (e: PointerEvent) => setMarkPointer(e, { x: e.clientX, y: e.clientY });
+    const onOut = (e: PointerEvent) => {
+      if (e.relatedTarget) return;
+      clearTimeout(leaveTimer.current);
+      leaveTimer.current = window.setTimeout(clearMarkPointer, 80);
+    };
+    win.addEventListener('pointermove', onMove, { passive: true });
+    doc.addEventListener('pointerout', onOut);
+    return () => {
+      try {
+        win.removeEventListener('pointermove', onMove);
+        doc.removeEventListener('pointerout', onOut);
+      } catch {
+        /* iframe may have navigated */
+      }
+    };
+  });
+  useEffect(() => {
+    const onOut = (e: PointerEvent) => {
+      if (!e.relatedTarget) clearMarkPointer();
+    };
+    const onOver = () => clearTimeout(leaveTimer.current);
+    const onMove = (e: PointerEvent) => {
+      clearTimeout(leaveTimer.current);
+      const f = frameRect.peek();
+      if (!f) return;
+      const x = e.clientX - f.left;
+      const y = e.clientY - f.top;
+      const inside = x >= 0 && y >= 0 && x <= f.width && y <= f.height;
+      const s = cssScale.peek();
+      setMarkPointer(e, inside ? { x: x / s, y: y / s } : null);
+    };
+    window.addEventListener('pointermove', onMove, { passive: true });
+    document.addEventListener('pointerout', onOut);
+    document.addEventListener('pointerover', onOver);
+    window.addEventListener('blur', clearMarkPointer);
+    return () => {
+      clearTimeout(leaveTimer.current);
+      window.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerout', onOut);
+      document.removeEventListener('pointerover', onOver);
+      window.removeEventListener('blur', clearMarkPointer);
+    };
+  }, []);
+}
+
+/** Pixels per unit of a wheel delta: Firefox reports lines, and a page gesture reports pages. */
+export function wheelUnit({ e, pageHeight }: { e: WheelEvent; pageHeight: number }): number {
+  if (e.deltaMode === WheelEvent.DOM_DELTA_LINE) return 16;
+  return e.deltaMode === WheelEvent.DOM_DELTA_PAGE ? pageHeight : 1;
+}
+
+export interface IframeOverlayCtx {
+  win: Window;
+  doc: Document;
+  frame: HTMLIFrameElement;
+}
+
+/**
+ * Attach event listeners to the iframe's contentWindow. Reattaches on iframe navigation.
+ * The `attach` callback owns its own listener registration and returns a cleanup function.
+ */
+export function useIframeOverlay(
+  frameRef: { current: HTMLIFrameElement | null },
+  attach: (ctx: IframeOverlayCtx) => () => void,
+) {
+  const attachRef = useRef(attach);
+  attachRef.current = attach;
+
+  useEffect(() => {
+    const frame = frameRef.current;
+    if (!frame) return;
+
+    let detach: (() => void) | undefined;
+
+    const setup = () => {
+      const win = frame.contentWindow;
+      const doc = frame.contentDocument;
+      if (!win || !doc) return;
+      detach = attachRef.current({ win, doc, frame });
+    };
+
+    setup();
+    const onLoad = () => {
+      detach?.();
+      setup();
+    };
+    frame.addEventListener('load', onLoad);
+    return () => {
+      detach?.();
+      frame.removeEventListener('load', onLoad);
+    };
+  }, [frameRef]);
+}
+
+/**
+ * rAF-batch a refresh callback whenever the iframe scrolls, content rescales, the frame moves,
+ * or the window resizes. Subscription is gated on `active()` so tools only listen while engaged.
+ */
+export function useIframeRectSync(active: () => boolean, refresh: () => void) {
+  const refreshRef = useRef(refresh);
+  refreshRef.current = refresh;
+
+  useSignalEffect(() => {
+    if (!active()) return;
+    let raf = 0;
+    const sync = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => refreshRef.current());
+    };
+    const unsubScroll = iframeScrollY.subscribe(sync);
+    const unsubScale = cssScale.subscribe(sync);
+    const unsubFrame = frameRect.subscribe(sync);
+    window.addEventListener('resize', sync);
+    return () => {
+      cancelAnimationFrame(raf);
+      unsubScroll();
+      unsubScale();
+      unsubFrame();
+      window.removeEventListener('resize', sync);
+    };
+  });
+}
+
+/**
+ * Keeps `frameRect` on the frame's box. The frame moves without an event of its own (a device
+ * switch, a panel docking beside it, the stage scrolling sideways), so this watches what moves
+ * it: sizes in the device frame's row, children joining that row, and scrolling.
+ */
+export function useFrameRectTracker({
+  frameRef,
+  viewerRef,
+}: {
+  frameRef: { current: HTMLIFrameElement | null };
+  viewerRef: { current: HTMLElement | null };
+}) {
+  // Reads no signal (`peek` only), so it runs once per mount.
+  useSignalEffect(() => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const read = () => {
+      const r = frame.getBoundingClientRect();
+      const b = frameRect.peek();
+      if (b && b.left === r.left && b.top === r.top && b.width === r.width && b.height === r.height) return;
+      frameRect.value = { left: r.left, top: r.top, width: r.width, height: r.height };
+    };
+    read();
+    const row = viewerRef.current?.parentElement;
+    const resize = new ResizeObserver(read);
+    const watch = () => {
+      resize.observe(frame);
+      if (row) for (const el of [row, ...row.children]) resize.observe(el);
+    };
+    watch();
+    const joins = new MutationObserver(watch);
+    if (row) joins.observe(row, { childList: true });
+    window.addEventListener('scroll', read, true);
+    window.addEventListener('resize', read);
+    return () => {
+      resize.disconnect();
+      joins.disconnect();
+      window.removeEventListener('scroll', read, true);
+      window.removeEventListener('resize', read);
+    };
+  });
+}

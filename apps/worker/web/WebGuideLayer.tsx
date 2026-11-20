@@ -1,0 +1,262 @@
+import {
+  deleteSelectedGuide,
+  GUIDE_HIT_PX,
+  GuideHint,
+  GuideLine,
+  GuidePill,
+  GuidePositionTag,
+  GuidePreview,
+  grabGuide,
+  guideReadout,
+} from '@ext/components/GuideLayer';
+import { injectDragSurface } from '@ext/lib/dom';
+import {
+  clearGuides,
+  flipGuide,
+  guides,
+  type Orientation,
+  removeGuide,
+  selectedGuideId,
+  updateGuide,
+} from '@ext/lib/guides';
+import { useDismissible } from '@ext/lib/keymap';
+import { pickGuideAtPoint } from '@ext/lib/measure';
+import { isPrimaryPress } from '@ext/lib/pointer';
+import { scrollOffset } from '@ext/lib/scroller';
+import { activeTool } from '@ext/lib/tool-state';
+import { useComputed, useSignal, useSignalEffect } from '@preact/signals';
+import { createPortal } from 'preact/compat';
+import { tinykeys } from 'tinykeys';
+import { capture } from './analytics';
+import { isElementNode, sameOriginWindow, useIframeOverlay } from './iframeOverlay';
+import { cssScale, frameRect, iframeScrollY } from './viewer-state';
+
+/** A fingertip covers far more than a mouse tip, so a touch grabs a guide from further off. */
+const TOUCH_HIT_PX = 20;
+
+/** The frame's scroll offset, or none while the frame is down or has navigated out of the proxy. */
+const off = (frame: HTMLIFrameElement | null) => {
+  const win = sameOriginWindow(frame);
+  return win ? scrollOffset(win) : { x: 0, y: 0 };
+};
+
+export function WebGuideLayer({ frameRef }: { frameRef: { current: HTMLIFrameElement | null } }) {
+  const cursor = useSignal<{ x: number; y: number } | null>(null);
+  const shift = useSignal(false);
+  const dragId = useSignal<string | null>(null);
+
+  const toIframeDoc = (x: number, y: number) => {
+    const o = off(frameRef.current);
+    return { x: x + o.x, y: y + o.y };
+  };
+
+  const toHostViewport = (x: number, y: number): { x: number; y: number } => {
+    const fr = frameRect.peek();
+    if (!fr) return { x, y };
+    const s = cssScale.value;
+    return { x: fr.left + x * s, y: fr.top + y * s };
+  };
+
+  const handlePointerMove = (iframeX: number, iframeY: number) => {
+    if (activeTool.value !== 'guide') return;
+    cursor.value = toHostViewport(iframeX, iframeY);
+    const id = dragId.peek();
+    if (id) {
+      const g = guides.peek().find((p) => p.id === id);
+      if (g) {
+        const doc = toIframeDoc(iframeX, iframeY);
+        updateGuide(id, g.orientation === 'vertical' ? doc.x : doc.y);
+      }
+    }
+  };
+
+  const handlePointerDown = (e: PointerEvent) => {
+    if (activeTool.value !== 'guide') return;
+    e.preventDefault();
+    e.stopPropagation();
+    grabGuide({
+      point: toIframeDoc(e.clientX, e.clientY),
+      vertical: e.shiftKey,
+      dragId,
+      hitPx: e.pointerType === 'touch' ? TOUCH_HIT_PX : GUIDE_HIT_PX,
+    });
+    cursor.value = toHostViewport(e.clientX, e.clientY);
+  };
+
+  const deleteSelected = (e: KeyboardEvent) => {
+    if (activeTool.value === 'guide') deleteSelectedGuide(e);
+  };
+  const keyBindings = {
+    Shift: () => {
+      if (activeTool.value === 'guide') shift.value = true;
+    },
+    Backspace: deleteSelected,
+    Delete: deleteSelected,
+  };
+  const keyBindingsUp = {
+    Shift: () => {
+      shift.value = false;
+    },
+  };
+
+  useIframeOverlay(frameRef, ({ win }) => {
+    const onMove = (e: PointerEvent) => {
+      if (e.isPrimary) handlePointerMove(e.clientX, e.clientY);
+    };
+    const onDown = (e: PointerEvent) => {
+      if (isPrimaryPress(e) && isElementNode(e.target)) handlePointerDown(e);
+    };
+    const onUp = () => {
+      dragId.value = null;
+    };
+    // Off the frame, onto our chrome or out of the window: no line to place there.
+    const onOut = (e: PointerEvent) => {
+      if (!e.relatedTarget && !dragId.peek()) cursor.value = null;
+    };
+    win.addEventListener('pointermove', onMove, true);
+    win.addEventListener('pointerout', onOut, true);
+    win.addEventListener('pointerdown', onDown, true);
+    win.addEventListener('pointerup', onUp, true);
+    win.addEventListener('pointercancel', onUp, true);
+    return () => {
+      try {
+        win.removeEventListener('pointermove', onMove, true);
+        win.removeEventListener('pointerout', onOut, true);
+        win.removeEventListener('pointerdown', onDown, true);
+        win.removeEventListener('pointerup', onUp, true);
+        win.removeEventListener('pointercancel', onUp, true);
+      } catch {
+        /* iframe may have navigated cross-origin */
+      }
+    };
+  });
+
+  useDismissible({
+    open: useComputed(() => activeTool.value === 'guide' && guides.value.length > 0),
+    close: () => {
+      capture('guides_cleared', { count: guides.peek().length });
+      clearGuides();
+    },
+  });
+
+  // Keys in the frame reach the host window as `ml-key`, so they bind here alone; the pointer
+  // stays with the frame. Over it the host only ever hears our own chrome, and reading that as
+  // the page dropped a guide under every click in a menu. Cleanup doubles as the tool-switch reset.
+  useSignalEffect(() => {
+    if (activeTool.value !== 'guide') return;
+    const onUp = () => {
+      dragId.value = null;
+    };
+    const onBlur = () => {
+      shift.value = false;
+      dragId.value = null;
+    };
+    window.addEventListener('pointerup', onUp, true);
+    window.addEventListener('blur', onBlur);
+    const unbindDown = tinykeys(window, keyBindings);
+    const unbindUp = tinykeys(window, keyBindingsUp, { event: 'keyup' });
+    return () => {
+      window.removeEventListener('pointerup', onUp, true);
+      window.removeEventListener('blur', onBlur);
+      unbindDown();
+      unbindUp();
+      cursor.value = null;
+      shift.value = false;
+      dragId.value = null;
+      selectedGuideId.value = null;
+    };
+  });
+
+  useSignalEffect(() => {
+    if (activeTool.value !== 'guide') return;
+    return injectDragSurface(frameRef.current?.contentDocument);
+  });
+
+  // Memoized so the cursor-injection effect only re-fires when the resulting
+  // cursor string actually changes — not on every mousemove tick.
+  const guideCursor = useComputed<'ew-resize' | 'ns-resize' | null>(() => {
+    if (activeTool.value !== 'guide') return null;
+    const id = dragId.value;
+    const dragged = id ? guides.value.find((g) => g.id === id) : null;
+    let target: { orientation: Orientation } | null | undefined = dragged;
+    const cur2 = cursor.value;
+    const r = frameRect.value;
+    if (!target && cur2 && r) {
+      const sc = cssScale.value;
+      const o = off(frameRef.current);
+      const pt = { x: (cur2.x - r.left) / sc + o.x, y: (cur2.y - r.top) / sc + o.y };
+      target = pickGuideAtPoint(pt, guides.value, GUIDE_HIT_PX) ?? null;
+    }
+    if (!target) return null;
+    return target.orientation === 'vertical' ? 'ew-resize' : 'ns-resize';
+  });
+  useSignalEffect(() => {
+    const c = guideCursor.value;
+    if (!c) return;
+    const doc = frameRef.current?.contentDocument;
+    if (!doc?.head) return;
+    const style = doc.createElement('style');
+    style.textContent = `*, *::before, *::after { cursor: ${c} !important; }`;
+    doc.head.appendChild(style);
+    return () => style.remove();
+  });
+
+  const isGuideTool = activeTool.value === 'guide';
+  const cur = cursor.value;
+  const orientation = shift.value ? 'vertical' : 'horizontal';
+  const previewPos = cur ? (orientation === 'vertical' ? cur.x : cur.y) : 0;
+  const dragging = !!dragId.value;
+
+  void iframeScrollY.value;
+
+  const bounds = frameRect.value;
+  if (!bounds) return null;
+  const s = cssScale.value;
+  const o = off(frameRef.current);
+  const docCursor = cur ? { x: (cur.x - bounds.left) / s + o.x, y: (cur.y - bounds.top) / s + o.y } : null;
+  const docToHost = (ori: Orientation, docPos: number): number =>
+    ori === 'vertical' ? bounds.left + (docPos - o.x) * s : bounds.top + (docPos - o.y) * s;
+  const hoveredGuide = docCursor ? pickGuideAtPoint(docCursor, guides.value, GUIDE_HIT_PX) : null;
+  const showPreview = isGuideTool && !dragging && cur && !hoveredGuide;
+  const selected = guides.value.find((g) => g.id === selectedGuideId.value) ?? null;
+  const dragGuide = dragId.value ? guides.value.find((g) => g.id === dragId.value) : null;
+  const readout = guideReadout({ dragGuide, orientation, preview: showPreview ? docCursor : null });
+
+  return createPortal(
+    <>
+      {isGuideTool && !guides.value.length && !dragging && <GuideHint bounds={bounds} />}
+      {guides.value.map((g) => (
+        <GuideLine
+          key={g.id}
+          orientation={g.orientation}
+          screenPosition={docToHost(g.orientation, g.position)}
+          selected={g.id === selectedGuideId.value}
+          hovered={isGuideTool && (g.id === hoveredGuide?.id || g.id === dragId.value)}
+          bounds={bounds}
+        />
+      ))}
+      {showPreview && <GuidePreview orientation={orientation} position={previewPos} bounds={bounds} />}
+      {isGuideTool && cur && readout && <GuidePositionTag x={cur.x} y={cur.y} text={readout} />}
+      {isGuideTool && selected && !dragging && (
+        <GuidePill
+          orientation={selected.orientation}
+          screenPosition={docToHost(selected.orientation, selected.position)}
+          bounds={bounds}
+          onFlip={(e) => {
+            const iframeX = (e.clientX - bounds.left) / s;
+            const iframeY = (e.clientY - bounds.top) / s;
+            const at = off(frameRef.current);
+            const newPos = selected.orientation === 'vertical' ? iframeY + at.y : iframeX + at.x;
+            flipGuide(selected.id, newPos);
+            capture('guide_flipped');
+          }}
+          onDelete={() => {
+            removeGuide(selected.id);
+            capture('guide_deleted', { via: 'pill' });
+          }}
+        />
+      )}
+    </>,
+    document.body,
+  );
+}

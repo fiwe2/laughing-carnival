@@ -1,0 +1,281 @@
+@import "tailwindcss";
+@import "@marklayer/tokens/theme.css";
+
+/* Every token this overlay uses comes from the shared theme: the same components
+   compile into the web app, and a token missing from one side renders at the
+   browser default inside this shadow root. */
+
+@layer base {
+  :host {
+    /* Viewport-sized and click-through: each layer owns its own hit area, and
+       the empty space between them must stay transparent to the page. The rest
+       undoes the UA styles a `popover` element gets (border, padding, centred
+       fit-content box, background, `overflow: auto`). */
+    position: fixed;
+    inset: 0;
+    display: block; /* also keeps the overlay up if `showPopover()` throws */
+    width: auto;
+    height: auto;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    overflow: visible;
+    pointer-events: none;
+    /* Ours now that WXT's positioning is declined (see index.tsx). At `auto` the
+       host lost to anything the page appended after we mounted. */
+    z-index: 2147483647;
+
+    --ml-glass-bg: oklch(0.96 0.003 280);
+    --ml-glass-bg-small: oklch(0.96 0.003 280);
+    --ml-glass-border: oklch(0 0 0 / 0.16);
+    --ml-glass-shadow-small:
+      0 0 0 0.5px oklch(0 0 0 / 0.1), 0 6px 24px oklch(0 0 0 / 0.08), 0 16px 48px oklch(0 0 0 / 0.05),
+      inset 0 0.5px 0 oklch(1 0 0 / 0.5);
+
+    /* ── Geist ── the design system's own token values, copied from the
+       stylesheet it ships. The toolbar and its tooltip are built from these;
+       the --ml-glass-* surfaces above still carry the panels. `shadow-menu`
+       drops Geist's outer background-200 ring — the bar floats over someone
+       else's page, where a solid ring of our own background reads as a
+       second border. */
+    --ds-background-100: #fff;
+    --ds-gray-100: #f2f2f2;
+    --ds-gray-700: #8f8f8f;
+    --ds-gray-900: #4d4d4d;
+    --ds-gray-1000: #171717;
+    --ds-gray-alpha-100: #0000000d;
+    --ds-gray-alpha-200: #00000015;
+    --ds-gray-alpha-400: #00000014;
+    --ds-gray-alpha-500: #00000036;
+    --ds-blue-800: #005edc;
+    --ds-amber-700: #ffb200;
+    --ds-red-700: #fc0035;
+    --ds-green-700: #28a948;
+    /* One step past green-700: the "approved" badge, so a signed-off thread
+       reads as further along than a resolved one rather than identical. */
+    --ds-green-900: #0a7d33;
+    --ds-focus-color: #0070f7;
+    --ds-shadow-menu: 0 0 0 1px #00000014, 0 1px 1px #00000005, 0 4px 8px -4px #0000000a, 0 16px 24px -8px #0000000f;
+    --ds-shadow-tooltip: 0 0 0 1px #00000014, 0 1px 1px #00000005, 0 4px 8px #0000000a;
+    --ds-shadow-border-small: 0 0 0 1px #00000014, 0 2px 2px #0000000a;
+
+    /* Semantic state colors — used for active/success/error/warning UI */
+    --ml-state-blue: oklch(0.62 0.18 250);
+    --ml-state-green: oklch(0.62 0.17 145);
+    --ml-state-red: oklch(0.62 0.22 25);
+    --ml-state-yellow: oklch(0.78 0.16 85);
+    --ml-state-accent: oklch(0.65 0.15 300);
+
+    /* Syntax highlighting (monokai-inspired) for inspector code blocks */
+    --ml-syntax-bg: oklch(0 0 0 / 0.04);
+    --ml-syntax-property: oklch(0.55 0.2 295);
+    --ml-syntax-value: oklch(0 0 0 / 0.78);
+    --ml-syntax-quote: oklch(0 0 0 / 0.62);
+  }
+
+  /* The container div — every layer and every Base UI portal renders into it —
+     and where the overlay's typography lives. A rule on `:host` would lose to
+     the page: for normal declarations the outer tree wins whatever the
+     specificity, and most sites reset `font-family` on `*`. One level in, no
+     page selector can reach it. Matched by shape rather than by tag, because
+     the div is WXT's private structure, not a promise in its types.
+
+     `all: initial` in place of an allowlist: an enumeration cannot see the
+     properties it forgets, and a page reset really does set `tab-size`,
+     `-webkit-text-size-adjust`, `word-break`, `font-feature-settings` and
+     `cursor` — all of which leaked. `all` keeps custom properties, so the
+     --ds-* ladder still inherits from `:host`, but it excludes `direction` and
+     it resets the host's inherited `pointer-events`, so both stay explicit.
+     System font stack because a content script cannot rely on the annotated
+     page's CSP allowing a webfont. */
+  :host > .ml-root {
+    all: initial;
+    box-sizing: border-box;
+    pointer-events: none;
+    direction: ltr;
+    /* Fills the host, and is the containing block for portalled content. */
+    position: absolute;
+    inset: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Geist", system-ui, sans-serif;
+    font-size: var(--text-ui);
+    line-height: var(--leading-ui);
+    color: var(--ds-gray-1000);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-synthesis: none;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    /* `:host(:not(…))`, never `:host:not(…)`: the host is featureless inside its
+       own shadow tree, so a compound directly on `:host` matches nothing — as
+       written, this whole block was dead and `theme: 'system'` rendered light. */
+    :host(:not(.ml-light)) {
+      --color-ml-glass-fg: #fff;
+      --color-ml-glass-accent: oklch(1 0 0 / 0.12);
+      --color-ml-glass-muted: oklch(1 0 0 / 0.06);
+      --color-ml-accent: oklch(0.78 0.13 300);
+      --color-ml-resolved: oklch(0.65 0 0);
+      --ml-glass-bg: oklch(0.14 0.012 280 / 0.92);
+      --ml-glass-bg-small: oklch(0.13 0.012 280 / 0.94);
+      --ml-glass-border: oklch(1 0 0 / 0.18);
+      --ml-glass-shadow-small:
+        0 0 0 0.5px oklch(0 0 0 / 0.3), 0 6px 24px oklch(0 0 0 / 0.25), 0 16px 48px oklch(0 0 0 / 0.15),
+        inset 0 0.5px 0 oklch(1 0 0 / 0.15);
+
+      /* Geist tokens — same set as the light block above. */
+      --ds-background-100: #000;
+      --ds-gray-100: #1a1a1a;
+      --ds-gray-700: #8f8f8f;
+      --ds-gray-900: #a0a0a0;
+      --ds-gray-1000: #ededed;
+      --ds-gray-alpha-100: #ffffff0f;
+      --ds-gray-alpha-200: #ffffff17;
+      --ds-gray-alpha-400: #ffffff24;
+      --ds-gray-alpha-500: #ffffff3d;
+      --ds-blue-800: #005fd8;
+      --ds-amber-700: #ffb200;
+      --ds-red-700: #f13242;
+      --ds-green-700: #00ab3e;
+      /* One step past green-700: the "approved" badge, so a signed-off thread
+         reads as further along than a resolved one rather than identical. */
+      --ds-green-900: #00c853;
+      --ds-focus-color: #50a8ff;
+      --ds-shadow-menu: 0 0 0 1px #ffffff25, 0 1px 1px #00000052, 0 4px 8px -4px #00000052, 0 16px 24px -8px #00000052;
+      --ds-shadow-tooltip: 0 0 0 1px #ffffff25, 0 1px 1px #00000052, 0 4px 8px #00000052;
+      --ds-shadow-border-small: 0 0 0 1px #ffffff25, 0 1px 2px #00000029;
+
+      --ml-state-blue: oklch(0.72 0.17 250);
+      --ml-state-green: oklch(0.78 0.18 145);
+      --ml-state-red: oklch(0.7 0.2 25);
+      --ml-state-yellow: oklch(0.85 0.17 85);
+      --ml-state-accent: oklch(0.78 0.13 300);
+
+      --ml-syntax-bg: oklch(1 0 0 / 0.05);
+      --ml-syntax-property: oklch(0.78 0.15 295);
+      --ml-syntax-value: oklch(1 0 0 / 0.85);
+      --ml-syntax-quote: oklch(1 0 0 / 0.6);
+    }
+  }
+
+  /* Manual dark override — same vars, outside media query so it always wins */
+  :host(.ml-dark) {
+    --color-ml-glass-fg: #fff;
+    --color-ml-glass-accent: oklch(1 0 0 / 0.12);
+    --color-ml-glass-muted: oklch(1 0 0 / 0.06);
+    --color-ml-accent: oklch(0.78 0.13 300);
+    --color-ml-resolved: oklch(0.65 0 0);
+    --ml-glass-bg: oklch(0.14 0.012 280 / 0.92);
+    --ml-glass-bg-small: oklch(0.13 0.012 280 / 0.94);
+    --ml-glass-border: oklch(1 0 0 / 0.18);
+    --ml-glass-shadow-small:
+      0 0 0 0.5px oklch(0 0 0 / 0.3), 0 6px 24px oklch(0 0 0 / 0.25), 0 16px 48px oklch(0 0 0 / 0.15),
+      inset 0 0.5px 0 oklch(1 0 0 / 0.15);
+
+    /* Geist tokens — same set as the light block above. */
+    --ds-background-100: #000;
+    --ds-gray-100: #1a1a1a;
+    --ds-gray-700: #8f8f8f;
+    --ds-gray-900: #a0a0a0;
+    --ds-gray-1000: #ededed;
+    --ds-gray-alpha-100: #ffffff0f;
+    --ds-gray-alpha-200: #ffffff17;
+    --ds-gray-alpha-400: #ffffff24;
+    --ds-gray-alpha-500: #ffffff3d;
+    --ds-blue-800: #005fd8;
+    --ds-amber-700: #ffb200;
+    --ds-red-700: #f13242;
+    --ds-green-700: #00ab3e;
+    /* One step past green-700: the "approved" badge, so a signed-off thread
+       reads as further along than a resolved one rather than identical. */
+    --ds-green-900: #00c853;
+    --ds-focus-color: #50a8ff;
+    --ds-shadow-menu: 0 0 0 1px #ffffff25, 0 1px 1px #00000052, 0 4px 8px -4px #00000052, 0 16px 24px -8px #00000052;
+    --ds-shadow-tooltip: 0 0 0 1px #ffffff25, 0 1px 1px #00000052, 0 4px 8px #00000052;
+    --ds-shadow-border-small: 0 0 0 1px #ffffff25, 0 1px 2px #00000029;
+
+    --ml-state-blue: oklch(0.72 0.17 250);
+    --ml-state-green: oklch(0.78 0.18 145);
+    --ml-state-red: oklch(0.7 0.2 25);
+    --ml-state-yellow: oklch(0.85 0.17 85);
+    --ml-state-accent: oklch(0.78 0.13 300);
+
+    --ml-syntax-bg: oklch(1 0 0 / 0.05);
+    --ml-syntax-property: oklch(0.78 0.15 295);
+    --ml-syntax-value: oklch(1 0 0 / 0.85);
+    --ml-syntax-quote: oklch(1 0 0 / 0.6);
+  }
+}
+
+@keyframes fadeInDown {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Bouncy spring entrance for floating surfaces (toolbar, panels). */
+@keyframes mlSpringIn {
+  from {
+    opacity: 0;
+    transform: scale(0.6) rotate(-8deg);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) rotate(0deg);
+  }
+}
+
+@keyframes mlPanelIn {
+  from {
+    opacity: 0;
+    transform: scale(0.92) translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+/* Connection-state pulse for the toolbar status dot. Color is set on `background-color`
+ * so the same keyframe works for green/yellow/red via the host class. */
+@keyframes mlStatusPulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 currentColor;
+  }
+  50% {
+    box-shadow: 0 0 0 5px transparent;
+  }
+}
+
+/* Reduce motion for users who request it: complete animations instantly and
+ * stop infinite loops (status pulse, spinners). Transitions stay snappy too.
+ * Scoped under :host so it only applies inside the extension's shadow root.
+ * `!important` is required to win over Tailwind utility classes and inline
+ * animation styles — this is the WCAG-recommended pattern. */
+@media (prefers-reduced-motion: reduce) {
+  :host *,
+  :host *::before,
+  :host *::after {
+    /* biome-ignore lint: required to override Tailwind utilities and inline animation styles for a11y */
+    animation-duration: 0.01ms !important;
+    /* biome-ignore lint: required to override Tailwind utilities and inline animation styles for a11y */
+    animation-iteration-count: 1 !important;
+    /* biome-ignore lint: required to override Tailwind utilities and inline animation styles for a11y */
+    transition-duration: 0.01ms !important;
+  }
+}

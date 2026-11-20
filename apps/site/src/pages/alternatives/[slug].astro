@@ -1,0 +1,111 @@
+---
+import { render } from 'astro:content';
+import CompetitorLayout from '../../layouts/CompetitorLayout.astro';
+import { alternativesH1, getAlternatives, getComparisons, getCompetitorPrices, relatedLinks } from '../../lib/collections';
+import { alternativesPath, MARKLAYER_PRICE, PRICES_CHECKED, vsPath } from '../../lib/site';
+
+export async function getStaticPaths() {
+  const [alternatives, comparisons] = await Promise.all([getAlternatives(), getComparisons()]);
+
+  const prices = getCompetitorPrices(comparisons).map((p) => [p.id, p.price] as const);
+
+  return alternatives.map((entry) => ({
+    params: { slug: entry.id },
+    props: {
+      entry,
+      prices,
+      related: relatedLinks({
+        entry,
+        siblings: alternatives,
+        others: comparisons,
+        siblingLink: (a) => ({ href: alternativesPath(a.id), label: `Free ${a.data.target} alternatives` }),
+        crossLink: (c) => ({ href: vsPath(c.id), label: `Compare MarkLayer vs ${c.data.competitor} head to head` }),
+      }),
+    },
+  }));
+}
+
+const { entry, related, prices } = Astro.props;
+const a = entry.data;
+const { Content } = await render(entry);
+
+const path = alternativesPath(entry.id);
+const h1 = alternativesH1(entry);
+
+/**
+ * What someone shopping alternatives actually wants is the prices side by side,
+ * and that is the one thing the `/vs/<slug>` twin cannot show: it compares a
+ * single competitor, not the whole shortlist. Each option that links to a
+ * comparison page resolves to that page's own Price row, so this table quotes
+ * nothing of its own.
+ *
+ * Deliberately the unfiltered set, not `getPublishedPrices`: that one drops rows
+ * carrying no figure so `/pricing` can list concrete numbers, and here every row
+ * needs a value — "Paid (subscription per user)" is worth more than a blank.
+ */
+const priceRows = new Map(prices);
+type Option = (typeof a.options)[number];
+const hrefFor = (o: Option): string | undefined => (o.self ? '/' : o.compare ? vsPath(o.compare) : o.url);
+const priceFor = (o: Option): string => {
+  if (o.self) return MARKLAYER_PRICE;
+  if (!o.compare) return 'Not tracked';
+  const price = priceRows.get(o.compare);
+  // Fails the build: a typo here would otherwise read "Not tracked" on a live page.
+  if (!price) throw new Error(`${entry.id}: no comparison price for "${o.compare}"`);
+  return price;
+};
+---
+
+<CompetitorLayout
+  data={a}
+  h1={h1}
+  path={path}
+  hub={{ name: 'Alternatives', path: '/alternatives' }}
+  Content={Content}
+  related={related}
+>
+  {/* The summary table carries `bestFor` and the price; the entries below carry
+      the prose. Splitting them that way keeps the same fact from appearing
+      twice on one page, which is what a "Best for" line under every pitch did. */}
+  <h2>{a.target} alternatives compared</h2>
+  <div class="ml-scroll-x ml-scroll-wide">
+    <table class="min-w-136">
+      <thead>
+        <tr>
+          <th scope="col" class="w-[26%]">Option</th>
+          <th scope="col" class="w-[36%]">Price</th>
+          <th scope="col">Best for</th>
+        </tr>
+      </thead>
+      <tbody>
+        {
+          a.options.map((o) => (
+            <tr>
+              <th scope="row">{hrefFor(o) ? <a href={hrefFor(o)}>{o.name}</a> : o.name}</th>
+              <td>{priceFor(o)}</td>
+              <td>{o.bestFor}</td>
+            </tr>
+          ))
+        }
+      </tbody>
+    </table>
+  </div>
+  <p class="ml-meta">
+    Prices as published by each vendor, checked {PRICES_CHECKED}, and read from each tool's own
+    <a href="/compare">comparison page</a>. "Not tracked" means there is no comparison page for that option yet, so
+    no price is quoted for it here.
+  </p>
+
+  <h2>Top free {a.target} alternatives</h2>
+  {
+    a.options.map((o, i) => (
+      <div class="ml-entry">
+        <h3>
+          {i + 1}. {hrefFor(o) ? <a href={hrefFor(o)}>{o.name}</a> : o.name}
+        </h3>
+        <p>{o.pitch}</p>
+      </div>
+    ))
+  }
+
+</CompetitorLayout>

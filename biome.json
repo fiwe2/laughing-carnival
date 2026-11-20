@@ -1,0 +1,74 @@
+{
+  "root": true,
+  "$schema": "https://biomejs.dev/schemas/2.5.11/schema.json",
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "correctness": {
+        "noUnusedVariables": "warn",
+        "noUnusedImports": "warn"
+      },
+      "suspicious": {
+        "noExplicitAny": "error"
+      },
+      "style": {
+        "noNonNullAssertion": "off"
+      },
+      "a11y": {
+        "useButtonType": "warn",
+        "useAnchorContent": "warn",
+        "noStaticElementInteractions": "off",
+        "useKeyWithClickEvents": "off"
+      }
+    }
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 120
+  },
+  "css": {
+    "parser": {
+      "cssModules": false,
+      "tailwindDirectives": true
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "semicolons": "always"
+    }
+  },
+  "files": {
+    "includes": [
+      "**",
+      "!**/node_modules",
+      "!**/.output",
+      "!**/.wxt",
+      "!**/.wrangler",
+      "!**/.turbo",
+      "!**/.astro",
+      "!**/dist",
+      "!graft",
+      "!.claude",
+      "!**/*.astro",
+      "!**/bun.lock",
+      "!**/*.svg",
+      "!**/public/assets",
+      "!apps/worker/public",
+      "!**/worker-configuration.d.ts",
+      "!apps/worker/index.html",
+      "!apps/worker/public/index.html",
+      "!**/generated.ts"
+    ]
+  }
+}

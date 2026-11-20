@@ -1,0 +1,446 @@
+import { type Signal, useComputed, useSignal, useSignalEffect } from '@preact/signals';
+import { tinykeys } from 'tinykeys';
+import { track } from '../lib/analytics';
+import { injectCrosshairCursor } from '../lib/dom';
+import {
+  addGuide,
+  clearGuides,
+  flipGuide,
+  guides,
+  type Orientation,
+  removeGuide,
+  selectedGuideId,
+  updateGuide,
+} from '../lib/guides';
+import { ensureScrollTickListener, scrollTick } from '../lib/host-mutations';
+import { pickGuideAtPoint, type RectLike } from '../lib/measure';
+import { scrollOffset, toDoc } from '../lib/scroller';
+import { isExtensionElement } from '../lib/selector';
+import { activeTool } from '../lib/tool-state';
+
+const HUE_GUIDE = 30;
+export const GUIDE_COLOR = `oklch(0.7 0.19 ${HUE_GUIDE} / 0.7)`;
+export const GUIDE_COLOR_SELECTED = `oklch(0.75 0.22 ${HUE_GUIDE})`;
+export const GUIDE_COLOR_PREVIEW = `oklch(0.7 0.19 ${HUE_GUIDE} / 0.35)`;
+export const GUIDE_PANEL = `oklch(0.22 0.015 200 / 0.96)`;
+export const GUIDE_PANEL_FG = `oklch(0.88 0.12 ${HUE_GUIDE})`;
+export const GUIDE_HIT_PX = 8;
+
+// A guide is page content, so it sits a layer under the chrome (toolbar and panels are
+// z-2147483646). At the top z the pill covered the toolbar whenever a guide ran under it.
+const GUIDE_LAYER = 'fixed z-2147483645';
+
+/**
+ * The readout beside the cursor. While placing it also names the modifier: a one-time
+ * hint was the only place Shift-for-vertical was written down.
+ */
+export const guideReadout = ({
+  dragGuide,
+  orientation,
+  preview,
+}: {
+  dragGuide: { orientation: Orientation; position: number } | null | undefined;
+  orientation: Orientation;
+  /** The doc-space cursor while a preview line shows, else null. */
+  preview: { x: number; y: number } | null;
+}): string | null => {
+  const at = (o: Orientation, position: number) => `${o === 'vertical' ? 'x' : 'y'}: ${Math.round(position)}px`;
+  if (dragGuide) return at(dragGuide.orientation, dragGuide.position);
+  if (!preview) return null;
+  const placing = at(orientation, orientation === 'vertical' ? preview.x : preview.y);
+  return orientation === 'horizontal' ? `${placing} · Shift for vertical` : placing;
+};
+
+/** Pick up the guide under the point, or drop a new one there; either way it is now being dragged. */
+export function grabGuide({
+  point,
+  vertical,
+  dragId,
+  hitPx = GUIDE_HIT_PX,
+}: {
+  /** In document coords. */
+  point: { x: number; y: number };
+  vertical: boolean;
+  dragId: Signal<string | null>;
+  /** How near a press must land to grab an existing guide rather than drop a new one. */
+  hitPx?: number;
+}) {
+  const hit = pickGuideAtPoint(point, guides.peek(), hitPx);
+  if (hit) {
+    selectedGuideId.value = hit.id;
+    dragId.value = hit.id;
+    return;
+  }
+  const orientation = vertical ? 'vertical' : 'horizontal';
+  const position = orientation === 'vertical' ? point.x : point.y;
+  const g = addGuide(orientation, position);
+  selectedGuideId.value = g.id;
+  dragId.value = g.id;
+}
+
+/** Backspace/Delete: the selected guide, else the newest. */
+export function deleteSelectedGuide(e: KeyboardEvent) {
+  const sel = selectedGuideId.peek() ?? guides.peek().at(-1)?.id;
+  if (!sel) return;
+  e.preventDefault();
+  e.stopPropagation();
+  removeGuide(sel);
+  track('guide_deleted', { via: 'key' });
+}
+
+/** Our own UI: the tool stands down over it, so a panel gets no preview and a click in it drops nothing. */
+const isOwnUi = (t: EventTarget | null) => t instanceof Element && isExtensionElement(t);
+
+// `screenPosition` is in viewport coords — callers subtract the current scroll offset
+// from the guide's stored document coord. `bounds` (optional) clips the line to a host
+// container (e.g. the web viewer's frame), so a guide never runs across the chrome, the
+// grey stage or a panel docked beside the frame.
+const lineStyle = (
+  orientation: Orientation,
+  screenPosition: number,
+  bounds: RectLike | undefined,
+  border: string,
+): Record<string, string | number> | null => {
+  if (bounds) {
+    if (orientation === 'vertical') {
+      if (screenPosition < bounds.left || screenPosition > bounds.left + bounds.width) return null;
+      return { left: screenPosition, top: bounds.top, width: 0, height: bounds.height, borderLeft: border };
+    }
+    if (screenPosition < bounds.top || screenPosition > bounds.top + bounds.height) return null;
+    return { left: bounds.left, top: screenPosition, width: bounds.width, height: 0, borderTop: border };
+  }
+  return orientation === 'vertical'
+    ? { left: screenPosition, top: 0, width: 0, height: '100vh', borderLeft: border }
+    : { left: 0, top: screenPosition, width: '100vw', height: 0, borderTop: border };
+};
+
+export function GuideLine({
+  orientation,
+  screenPosition,
+  selected,
+  hovered,
+  bounds,
+}: {
+  orientation: Orientation;
+  screenPosition: number;
+  selected: boolean;
+  hovered?: boolean;
+  bounds?: RectLike;
+}) {
+  const color = selected || hovered ? GUIDE_COLOR_SELECTED : GUIDE_COLOR;
+  const thickness = hovered || selected ? 2 : 1;
+  const style = lineStyle(orientation, screenPosition, bounds, `${thickness}px solid ${color}`);
+  if (!style) return null;
+  return <div class={`${GUIDE_LAYER} pointer-events-none`} style={style} />;
+}
+
+export function GuidePreview({
+  orientation,
+  position,
+  bounds,
+}: {
+  orientation: Orientation;
+  position: number;
+  bounds?: RectLike;
+}) {
+  const style = lineStyle(orientation, position, bounds, `1px dashed ${GUIDE_COLOR_PREVIEW}`);
+  if (!style) return null;
+  return <div class={`${GUIDE_LAYER} pointer-events-none`} style={style} />;
+}
+
+// Room the longest readout needs past the cursor. Nearer the right or bottom edge than this,
+// the tag flips to the cursor's other side, so it is never sliced.
+const READOUT_ROOM = { x: 240, y: 32 };
+
+export function GuidePositionTag({ x, y, text }: { x: number; y: number; text: string }) {
+  const dx = x > window.innerWidth - READOUT_ROOM.x ? 'calc(-100% - 8px)' : '8px';
+  const dy = y > window.innerHeight - READOUT_ROOM.y ? 'calc(-100% - 8px)' : '8px';
+  return (
+    // Rides the cursor like a tooltip, so unlike the line it tops the chrome; it never takes a click.
+    <div
+      class="fixed z-2147483647 pointer-events-none font-mono text-micro tabular-nums whitespace-nowrap"
+      style={{
+        left: x,
+        top: y,
+        transform: `translate(${dx}, ${dy})`,
+        padding: '2px 6px',
+        borderRadius: 4,
+        background: GUIDE_PANEL,
+        color: GUIDE_PANEL_FG,
+        border: `1px solid ${GUIDE_COLOR}`,
+        boxShadow: '0 2px 8px oklch(0 0 0 / 0.3)',
+      }}
+    >
+      {text}
+    </div>
+  );
+}
+
+const stopEvent = (e: Event) => {
+  e.preventDefault();
+  e.stopPropagation();
+};
+const PILL_BTN = 'inline-flex items-center gap-1 px-2 py-1 cursor-pointer hover:brightness-110';
+
+export function GuidePill({
+  orientation,
+  screenPosition,
+  onFlip,
+  onDelete,
+  bounds,
+}: {
+  orientation: Orientation;
+  screenPosition: number;
+  onFlip: (e: MouseEvent) => void;
+  onDelete: () => void;
+  bounds?: RectLike;
+}) {
+  // Anchor the pill inside the host container (the web viewer's iframe rect) when
+  // provided, otherwise to the viewport edge. Keeps the pill out of UI chrome like the Topbar.
+  const anchor = bounds ? { x: bounds.left + 16, y: bounds.top + 16 } : { x: 16, y: 16 };
+  const style: Record<string, string | number> =
+    orientation === 'vertical'
+      ? { left: screenPosition, top: anchor.y, transform: 'translate(-50%, 0)' }
+      : { left: anchor.x, top: screenPosition, transform: 'translate(0, -50%)' };
+  return (
+    <div
+      class={`${GUIDE_LAYER} inline-flex items-center font-mono text-micro tabular-nums rounded-md overflow-hidden`}
+      style={{
+        ...style,
+        background: GUIDE_PANEL,
+        color: GUIDE_PANEL_FG,
+        border: `1px solid ${GUIDE_COLOR_SELECTED}`,
+        boxShadow: '0 2px 8px oklch(0 0 0 / 0.3)',
+      }}
+      onMouseDown={stopEvent}
+    >
+      <button
+        type="button"
+        class={PILL_BTN}
+        title={`flip to ${orientation === 'vertical' ? 'horizontal' : 'vertical'}`}
+        onClick={(e) => {
+          stopEvent(e);
+          onFlip(e);
+        }}
+      >
+        <span>⇄</span>
+        <span>flip</span>
+      </button>
+      <span style={{ width: 1, alignSelf: 'stretch', background: GUIDE_COLOR_SELECTED, opacity: 0.5 }} />
+      <button
+        type="button"
+        class={PILL_BTN}
+        title="delete guide"
+        onClick={(e) => {
+          stopEvent(e);
+          onDelete();
+        }}
+      >
+        <span>×</span>
+        <span>delete</span>
+      </button>
+    </div>
+  );
+}
+
+export function GuideHint({ bounds }: { bounds?: RectLike }) {
+  // Pin to the host container's top so the hint doesn't render over outer chrome like the Topbar.
+  const containerStyle: Record<string, string | number> = bounds
+    ? { left: bounds.left + bounds.width / 2, top: bounds.top + 20, transform: 'translate(-50%, 0)' }
+    : { left: '50%', top: 20, transform: 'translate(-50%, 0)' };
+  return (
+    <div
+      class={`${GUIDE_LAYER} pointer-events-none
+             px-3 py-1.5 text-mini font-medium tracking-label rounded-lg
+             animate-[fadeInDown_180ms_ease-out] font-mono whitespace-nowrap`}
+      style={{
+        ...containerStyle,
+        background: GUIDE_PANEL,
+        color: GUIDE_PANEL_FG,
+        border: `1px solid ${GUIDE_COLOR}`,
+        boxShadow: '0 6px 20px oklch(0 0 0 / 0.35)',
+      }}
+    >
+      Click to drop · Shift+click for vertical · Drag a guide to move · Backspace to delete · ⌘Z to undo
+    </div>
+  );
+}
+
+/**
+ * Always-mounted overlay that renders document-anchored ruler guides.
+ * Guides scroll with the page (Figma/Photoshop semantics) — stored as
+ * document coords and rendered with the current scroll subtracted.
+ */
+export function GuideLayer() {
+  const cursor = useSignal<{ x: number; y: number } | null>(null);
+  const shift = useSignal(false);
+  const dragId = useSignal<string | null>(null);
+
+  // Listeners and keybindings only exist while the guide tool is active —
+  // tool-switch tear-down doubles as the state reset.
+  useSignalEffect(() => {
+    if (activeTool.value !== 'guide') return;
+    ensureScrollTickListener();
+
+    const onMove = (e: MouseEvent) => {
+      const id = dragId.peek();
+      // A drag keeps going across the toolbar; a hover over it is not a placement.
+      if (!id && isOwnUi(e.target)) {
+        cursor.value = null;
+        return;
+      }
+      cursor.value = { x: e.clientX, y: e.clientY };
+      if (id) {
+        const g = guides.peek().find((p) => p.id === id);
+        if (g) {
+          const doc = toDoc({ x: e.clientX, y: e.clientY });
+          updateGuide(id, g.orientation === 'vertical' ? doc.x : doc.y);
+        }
+      }
+    };
+
+    const onOut = (e: MouseEvent) => {
+      if (!e.relatedTarget && !dragId.peek()) cursor.value = null;
+    };
+
+    const onDown = (e: MouseEvent) => {
+      if (isOwnUi(e.target)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      grabGuide({
+        point: toDoc({ x: e.clientX, y: e.clientY }),
+        vertical: e.shiftKey,
+        dragId,
+      });
+    };
+
+    const onUp = () => {
+      dragId.value = null;
+    };
+
+    const onBlur = () => {
+      shift.value = false;
+      dragId.value = null;
+    };
+
+    const unbindKeysDown = tinykeys(window, {
+      Shift: () => {
+        shift.value = true;
+      },
+      Escape: (e) => {
+        if (!guides.peek().length) return;
+        e.preventDefault();
+        e.stopPropagation();
+        track('guides_cleared', { count: guides.peek().length });
+        clearGuides();
+      },
+      Backspace: deleteSelectedGuide,
+      Delete: deleteSelectedGuide,
+    });
+    const unbindKeysUp = tinykeys(
+      window,
+      {
+        Shift: () => {
+          shift.value = false;
+        },
+      },
+      { event: 'keyup' },
+    );
+
+    window.addEventListener('mousemove', onMove, true);
+    window.addEventListener('mouseout', onOut, true);
+    window.addEventListener('mousedown', onDown, true);
+    window.addEventListener('mouseup', onUp, true);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      unbindKeysDown();
+      unbindKeysUp();
+      window.removeEventListener('mousemove', onMove, true);
+      window.removeEventListener('mouseout', onOut, true);
+      window.removeEventListener('mousedown', onDown, true);
+      window.removeEventListener('mouseup', onUp, true);
+      window.removeEventListener('blur', onBlur);
+      cursor.value = null;
+      shift.value = false;
+      dragId.value = null;
+      selectedGuideId.value = null;
+    };
+  });
+
+  useSignalEffect(() => {
+    if (activeTool.value !== 'guide') return;
+    return injectCrosshairCursor(document);
+  });
+
+  const isGuideTool = activeTool.value === 'guide';
+  const cur = cursor.value;
+  const orientation = shift.value ? 'vertical' : 'horizontal';
+  const previewPos = cur ? (orientation === 'vertical' ? cur.x : cur.y) : 0;
+  const dragging = !!dragId.value;
+
+  void scrollTick.value;
+  const { x: sx, y: sy } = typeof window === 'undefined' ? { x: 0, y: 0 } : scrollOffset(window);
+
+  const docCursor = cur ? { x: cur.x + sx, y: cur.y + sy } : null;
+  const hoveredGuide = docCursor ? pickGuideAtPoint(docCursor, guides.value, GUIDE_HIT_PX) : null;
+  // Derived as a computed so the cursor-injection effect only re-runs when the
+  // resulting cursor string actually changes — not on every mousemove tick.
+  const guideCursor = useComputed<'ew-resize' | 'ns-resize' | null>(() => {
+    if (activeTool.value !== 'guide') return null;
+    const id = dragId.value;
+    const dragged = id ? guides.value.find((g) => g.id === id) : null;
+    const cur2 = cursor.value;
+    const target = dragged ?? (cur2 ? pickGuideAtPoint(toDoc(cur2), guides.value, GUIDE_HIT_PX) : null);
+    if (!target) return null;
+    return target.orientation === 'vertical' ? 'ew-resize' : 'ns-resize';
+  });
+  useSignalEffect(() => {
+    const c = guideCursor.value;
+    if (!c) return;
+    const style = document.createElement('style');
+    style.textContent = `*, *::before, *::after { cursor: ${c} !important; }`;
+    document.head.appendChild(style);
+    return () => style.remove();
+  });
+  const showPreview = isGuideTool && !dragging && cur && !hoveredGuide;
+  const selected = guides.value.find((g) => g.id === selectedGuideId.value) ?? null;
+  const screenSelectedPos = selected
+    ? selected.orientation === 'vertical'
+      ? selected.position - sx
+      : selected.position - sy
+    : 0;
+  const dragGuide = dragId.value ? guides.value.find((g) => g.id === dragId.value) : null;
+  const readout = guideReadout({ dragGuide, orientation, preview: showPreview ? docCursor : null });
+
+  return (
+    <>
+      {isGuideTool && !guides.value.length && !dragging && <GuideHint />}
+      {guides.value.map((g) => (
+        <GuideLine
+          key={g.id}
+          orientation={g.orientation}
+          screenPosition={g.orientation === 'vertical' ? g.position - sx : g.position - sy}
+          selected={g.id === selectedGuideId.value}
+          hovered={isGuideTool && (g.id === hoveredGuide?.id || g.id === dragId.value)}
+        />
+      ))}
+      {showPreview && <GuidePreview orientation={orientation} position={previewPos} />}
+      {isGuideTool && cur && readout && <GuidePositionTag x={cur.x} y={cur.y} text={readout} />}
+      {isGuideTool && selected && !dragging && (
+        <GuidePill
+          orientation={selected.orientation}
+          screenPosition={screenSelectedPos}
+          onFlip={(e) => {
+            const newPos = selected.orientation === 'vertical' ? e.clientY + sy : e.clientX + sx;
+            flipGuide(selected.id, newPos);
+            track('guide_flipped');
+          }}
+          onDelete={() => {
+            removeGuide(selected.id);
+            track('guide_deleted', { via: 'pill' });
+          }}
+        />
+      )}
+    </>
+  );
+}

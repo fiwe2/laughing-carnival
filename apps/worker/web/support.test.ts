@@ -1,0 +1,185 @@
+import { describe, expect, test } from 'bun:test';
+import type { CommentOp, CommentStatus } from '@marklayer/types/ops';
+import {
+  agentWorkLanded,
+  parseSupportRecord,
+  recordSignal,
+  type SupportRecord,
+  type SupportSignal,
+  shouldOfferSupport,
+} from './support';
+
+const fresh: SupportRecord = {
+  days: [],
+  shares: 0,
+  mcp: false,
+  notes: 0,
+  answers: 0,
+  answeredOn: null,
+  notesAtAnswer: 0,
+  supported: false,
+};
+const veteran: SupportRecord = { ...fresh, days: ['2026-08-01', '2026-08-04'] };
+
+const offer = (record: SupportRecord, date = '2026-08-10') => shouldOfferSupport({ record, date });
+const fold = (record: SupportRecord, signals: SupportSignal[], date?: string) =>
+  signals.reduce((r, signal) => recordSignal({ record: r, signal, date }), record);
+const times = (n: number, signal: SupportSignal): SupportSignal[] => Array<SupportSignal>(n).fill(signal);
+/** 25 notes, the first card answered on 2026-09-01, then `since` more notes. */
+const answeredOnce = (since = 30) =>
+  fold({ ...veteran, shares: 1 }, [...times(25, 'noted'), 'answered', ...times(since, 'noted')], '2026-09-01');
+
+describe('shouldOfferSupport — who never sees it', () => {
+  test('somebody who has not authored anything yet', () => {
+    expect(offer({ ...fresh, shares: 12, mcp: true })).toBe(false);
+  });
+
+  test('somebody who came back but has not used it with anyone or for anything', () => {
+    expect(offer({ ...veteran, shares: 0, notes: 9 })).toBe(false);
+  });
+
+  test('somebody who said not to ask again', () => {
+    const declined = fold({ ...veteran, shares: 1 }, ['optedOut', ...times(99, 'noted')], '2026-09-01');
+    expect(offer(declined, '2027-01-01')).toBe(false);
+  });
+
+  test('somebody already answered three times, no matter how much they use it', () => {
+    const thrice = fold(
+      answeredOnce(),
+      ['answered', ...times(99, 'noted'), 'answered', ...times(99, 'noted')],
+      '2026-11-01',
+    );
+    expect(offer(thrice, '2027-06-01')).toBe(false);
+  });
+
+  test('somebody who already supported', () => {
+    expect(offer({ ...veteran, shares: 99, mcp: true, supported: true })).toBe(false);
+  });
+});
+
+describe('shouldOfferSupport — who does', () => {
+  test('a developer who wired up MCP and keeps coming back', () => {
+    expect(offer({ ...veteran, mcp: true })).toBe(true);
+  });
+
+  test('somebody who sent one share link, across several days of use', () => {
+    expect(offer({ ...veteran, shares: 1 })).toBe(true);
+  });
+
+  test('somebody who shared on the very first day they used it', () => {
+    // The share is the bar; a second calendar day is only a return visit.
+    expect(offer({ ...fresh, days: ['2026-08-01'], shares: 1 })).toBe(true);
+  });
+
+  test('somebody who never shares, but leaves a first batch of notes', () => {
+    expect(offer({ ...veteran, notes: 10 })).toBe(true);
+  });
+});
+
+describe('shouldOfferSupport — the second and third asks', () => {
+  test('a fortnight after the first answer, with real use since', () => {
+    expect(offer(answeredOnce(), '2026-09-15')).toBe(true);
+  });
+
+  test('not a day before the fortnight is out', () => {
+    expect(offer(answeredOnce(), '2026-09-14')).toBe(false);
+  });
+
+  test('not on notes left before the first answer', () => {
+    // 39 in all clears 15, but only 14 came after the answer.
+    expect(offer(answeredOnce(14), '2026-09-15')).toBe(false);
+  });
+
+  test('a third ask waits a fortnight from the second answer', () => {
+    const second = fold(answeredOnce(), ['answered', ...times(15, 'noted')], '2026-09-15');
+    expect(offer(second, '2026-09-28')).toBe(false);
+    expect(offer(second, '2026-09-29')).toBe(true);
+  });
+
+  test('a record from the one-ask days waits a fortnight from its next visit', () => {
+    let r = parseSupportRecord('{"days":["2026-08-01"],"shares":1,"asked":true}');
+    r = fold(r, times(15, 'noted'));
+    // Undated: there is no wait to have served yet, whatever the notes.
+    expect(offer(r, '2027-01-01')).toBe(false);
+    r = fold(r, ['used'], '2026-10-05');
+    expect(offer(r, '2026-10-18')).toBe(false);
+    expect(offer(r, '2026-10-19')).toBe(true);
+  });
+});
+
+describe('recordSignal', () => {
+  test('counts a day once however many times it is used', () => {
+    expect(fold(fresh, times(20, 'used'), '2026-08-01').days).toEqual(['2026-08-01']);
+  });
+
+  test('stops counting shares once the bar is cleared', () => {
+    // A bar to clear, not a tally of what somebody sent.
+    expect(fold(fresh, times(20, 'shared')).shares).toBe(1);
+  });
+
+  test('stops collecting dates once it has enough to answer the question', () => {
+    let r = fresh;
+    for (const date of ['2026-08-01', '2026-08-02', '2026-08-03', '2026-08-04', '2026-08-05']) {
+      r = recordSignal({ record: r, signal: 'used', date });
+    }
+    // The record answers "enough distinct days?" — it is not a usage log.
+    expect(r.days).toEqual(['2026-08-01']);
+  });
+});
+
+describe('parseSupportRecord', () => {
+  const corrupt: (string | null)[] = [null, '', 'not json', '[]', '"a string"', '{"days":"nope"}'];
+  test.each(corrupt)('%p reads as a new person', (raw) => {
+    expect(parseSupportRecord(raw)).toEqual(fresh);
+  });
+
+  test('a corrupt flag or count neither suppresses the card nor buys an extra ask', () => {
+    // Only a literal `true` counts as a flag, and only a whole number >= 0 as a count.
+    expect(parseSupportRecord('{"asked":"yes","supported":"true","answers":-1,"notes":2.5}')).toEqual(fresh);
+  });
+
+  test('round-trips a real record', () => {
+    const r = answeredOnce();
+    expect(parseSupportRecord(JSON.stringify(r))).toEqual(r);
+  });
+});
+
+describe('agentWorkLanded: the moment an agent finished something', () => {
+  const comment = (over: Partial<CommentOp> = {}): CommentOp => ({
+    id: 'c1',
+    color: '#000',
+    lineWidth: 2,
+    tool: 'comment',
+    num: 1,
+    text: 'Fix the nav',
+    x: 0,
+    y: 0,
+    ts: 0,
+    assignedAgent: 'mcp-claude',
+    ...over,
+  });
+
+  test('an agent resolving what it picked up', () => {
+    const seen = new Map<string, CommentStatus>();
+    expect(agentWorkLanded({ seen, ops: [comment({ status: 'in_progress' })] })).toBe(false);
+    expect(agentWorkLanded({ seen, ops: [comment({ status: 'resolved' })] })).toBe(true);
+  });
+
+  test('not work that was already settled when the room loaded', () => {
+    const seen = new Map<string, CommentStatus>();
+    expect(agentWorkLanded({ seen, ops: [] })).toBe(false);
+    expect(agentWorkLanded({ seen, ops: [comment({ status: 'resolved' })] })).toBe(false);
+  });
+
+  test('not a settled thread moving on to approved', () => {
+    const seen = new Map<string, CommentStatus>();
+    agentWorkLanded({ seen, ops: [comment({ status: 'resolved' })] });
+    expect(agentWorkLanded({ seen, ops: [comment({ status: 'approved' })] })).toBe(false);
+  });
+
+  test('not a thread no agent took on', () => {
+    const seen = new Map<string, CommentStatus>();
+    agentWorkLanded({ seen, ops: [comment({ assignedAgent: undefined })] });
+    expect(agentWorkLanded({ seen, ops: [comment({ assignedAgent: undefined, status: 'resolved' })] })).toBe(false);
+  });
+});

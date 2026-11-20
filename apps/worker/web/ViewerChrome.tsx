@@ -1,0 +1,545 @@
+import { Slider } from '@base-ui/react/slider';
+import { Toggle } from '@base-ui/react/toggle';
+import { ToggleGroup } from '@base-ui/react/toggle-group';
+import { AvatarGroup } from '@ext/components/AvatarGroup';
+import { IdentityCard } from '@ext/components/IdentityCard';
+import { Tooltip } from '@ext/components/Tooltip';
+import { AgentMark } from '@ext/lib/agents';
+import { geist } from '@ext/lib/geist';
+import { cycleTheme, theme } from '@ext/lib/prefs';
+import { peerCount, peers } from '@ext/lib/presence';
+import { connected } from '@ext/lib/realtime';
+import { copyText } from '@ext/lib/toasts';
+import { elementToolsUnavailable } from '@ext/lib/tool-state';
+import type { DeviceMode } from '@ext/lib/types';
+import { isUploadPath } from '@marklayer/brand/links';
+import { agentLabel, isAgentPeer } from '@marklayer/types/agents';
+import { DEVICE_MODES } from '@marklayer/types/ops';
+import { cn } from '@marklayer/ui/cn';
+import {
+  ChevronLeft,
+  ChevronRight,
+  Columns3,
+  Heart,
+  Info,
+  Link,
+  MessageSquare,
+  Mic,
+  MicOff,
+  MonitorCog,
+  MonitorPlay,
+  Moon,
+  Sun,
+  Video,
+  VideoOff,
+} from 'lucide-preact';
+import type { ComponentChildren } from 'preact';
+import { lazy, Suspense } from 'preact/compat';
+import { capture } from './analytics';
+import { canvasFitted, canvasZoom, toggleCanvasFit } from './deviceCamera';
+import { PresenceMenu } from './PresenceMenu';
+import { navigateTo, pageUrl, withScheme } from './projects';
+import { type PreviewInfo, previewInfo } from './review';
+import { SharePopover } from './SharePopover';
+import { DEVICE_ICONS, HOME_LINK_PROPS, Logo } from './shared';
+import { openSupportCard } from './support-ui';
+import { onFollowScroll, presenting, setPresenting, showAnnotationPanel, showInfoPanel } from './ui-state';
+import { cssScale, deviceMode, deviceOverview, isReadonly, viewerZoom } from './viewer-state';
+import { toggleMute, videoActive, voiceActive, voiceMuted } from './voiceSignals';
+import { notchToZoom, thumbNotch, ZOOM_LARGE_STEP, ZOOM_NOTCHES } from './zoomScale';
+
+// Only fetched when a user joins voice/video or opens the device picker.
+const DeviceMenu = lazy(() => import('./DeviceMenu').then((m) => ({ default: m.DeviceMenu })));
+
+// Local user sits at index 0, so the overflow badge lands at MAX_VISIBLE_PEERS + 1.
+const MAX_VISIBLE_PEERS = 3;
+
+/** Icon control in the bar. `on` is the control's state, not a style variant. */
+export function BarButton({
+  icon,
+  tip,
+  onClick,
+  on,
+  disabled,
+}: {
+  icon: ComponentChildren;
+  tip: string;
+  onClick: () => void;
+  on?: boolean;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={tip}
+      class={cn(geist.ctl, on ? geist.ctlOn : geist.ctlIdle, disabled && 'opacity-50 pointer-events-none')}
+    >
+      {icon}
+      <Tooltip text={tip} placement="bottom" />
+    </button>
+  );
+}
+
+function BrandLink() {
+  return (
+    <a
+      {...HOME_LINK_PROPS}
+      class={cn(
+        'flex items-center gap-1.5 h-8 px-2 rounded-md no-underline shrink-0 cursor-pointer',
+        'hover:bg-(--ds-gray-alpha-100) transition-colors duration-150',
+      )}
+    >
+      <Logo size={20} />
+      <span class="text-ui font-semibold tracking-ui text-(--ds-gray-1000)">MarkLayer</span>
+    </a>
+  );
+}
+
+/** The page being annotated: editable, Enter to navigate, click the icon to copy.
+ *  An uploaded file has no url worth either — the path describes nothing to a
+ *  reader, and copying it yields a relative fragment rather than a link (the
+ *  shareable one comes from the share button). So the field keeps only its
+ *  second job there: somewhere to type the next page. */
+function UrlField() {
+  const uploaded = isUploadPath(pageUrl.value);
+  return (
+    <div class={cn(geist.field, 'flex-1 min-w-0 flex items-center gap-2 px-2.5')}>
+      {!uploaded && (
+        <Link
+          size={14}
+          strokeWidth={1.5}
+          class="text-(--ds-gray-900) shrink-0 cursor-pointer hover:text-(--ds-gray-1000) transition-colors duration-150"
+          aria-label="Copy URL"
+          onClick={() => copyText(pageUrl.value, 'URL copied')}
+        />
+      )}
+      <input
+        name="pageUrl"
+        type="text"
+        placeholder={uploaded ? 'Paste a URL to annotate…' : undefined}
+        defaultValue={uploaded ? '' : pageUrl.value}
+        class={cn(geist.input, 'flex-1 truncate cursor-text')}
+        title="Edit URL and press Enter to navigate"
+        onKeyDown={(e) => {
+          if (e.key !== 'Enter') return;
+          const url = e.currentTarget.value.trim();
+          if (!url) return;
+          navigateTo({ url: withScheme(url), source: 'url_bar' });
+        }}
+        onFocus={(e) => e.currentTarget.select()}
+      />
+    </div>
+  );
+}
+
+type VersionRef = PreviewInfo['previous'];
+
+const viewportLabel = (m: DeviceMode) => `${m.charAt(0).toUpperCase() + m.slice(1)} viewport`;
+
+function ViewportToggle({ mode }: { mode: DeviceMode }) {
+  const Icon = DEVICE_ICONS[mode];
+  const label = viewportLabel(mode);
+  return (
+    <Toggle value={mode} aria-label={label} className={geist.segment}>
+      <Icon size={15} strokeWidth={1.5} aria-hidden="true" />
+      <Tooltip text={label} placement="bottom" />
+    </Toggle>
+  );
+}
+
+/** Mutually exclusive views, so the selection reads as a panel raised off a track. */
+function ViewportSwitcher() {
+  // A PDF or an image is laid out to the frame's width, not by media queries —
+  // switching to a phone viewport would only make the same page narrower, so it
+  // isn't offered.
+  if (elementToolsUnavailable.value) return null;
+  return (
+    <ToggleGroup
+      value={[deviceMode.value]}
+      onValueChange={(next: DeviceMode[]) => {
+        // One viewport is always shown, so an empty selection holds the current one.
+        if (next[0]) deviceMode.value = next[0];
+      }}
+      aria-label="Viewport"
+      className={geist.track}
+    >
+      {DEVICE_MODES.map((mode) => (
+        <ViewportToggle key={mode} mode={mode} />
+      ))}
+    </ToggleGroup>
+  );
+}
+
+/** Beside the switcher, and gone with it on a phone or a PDF, where there is nothing to compare. */
+function DeviceOverviewButton() {
+  if (elementToolsUnavailable.value) return null;
+  return (
+    <div class="max-md:hidden">
+      <BarButton
+        icon={<Columns3 size={16} strokeWidth={1.5} aria-hidden="true" />}
+        tip="All devices"
+        on={deviceOverview.value}
+        onClick={() => {
+          deviceOverview.value = !deviceOverview.value;
+          capture('device_overview_toggled', { on: deviceOverview.value });
+        }}
+      />
+    </div>
+  );
+}
+
+/**
+ * Fills from 100% out to the thumb: how far the page is zoomed, and which way.
+ * An edge-aligned thumb travels `100% - --thumb`, so the fill shares the var to end under its centre.
+ */
+function ZoomFill({ notch }: { notch: number }) {
+  const at = (notch + ZOOM_NOTCHES) / (ZOOM_NOTCHES * 2);
+  const from = Math.min(at, 0.5);
+  const to = Math.max(at, 0.5);
+  return (
+    <span
+      aria-hidden="true"
+      class={cn(
+        'absolute top-0 h-full rounded-full bg-(--ds-gray-700) transition-colors duration-150',
+        'group-hover:bg-(--ds-gray-900) group-data-dragging:bg-(--ds-gray-900)',
+      )}
+      style={{
+        left: `calc(var(--thumb) / 2 + (100% - var(--thumb)) * ${from})`,
+        width: `calc((100% - var(--thumb)) * ${to - from})`,
+      }}
+    />
+  );
+}
+
+/**
+ * In auto the thumb shows the fitted scale, and dragging takes over from the fit.
+ * The readout toggles between the two anchors, fit and 100%.
+ */
+/** While the device canvas is up, the readout is its zoom: the page's own slider would act on a hidden stage. */
+function CanvasZoomReadout() {
+  const fitted = canvasFitted.value;
+  const pct = `${Math.round(canvasZoom.value * 100)}%`;
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        toggleCanvasFit();
+        capture('canvas_fit_toggled');
+      }}
+      aria-label={fitted ? `${pct}, zoom to 100%` : `${pct}, fit all devices`}
+      class={cn(geist.ctl, geist.ctlIdle, 'w-11 shrink-0 text-meta font-medium tabular-nums')}
+    >
+      {pct}
+      <Tooltip text={fitted ? 'Zoom to 100%' : 'Fit all devices'} shortcut={fitted ? '⇧0' : '⇧1'} placement="bottom" />
+    </button>
+  );
+}
+
+function ZoomControl() {
+  if (deviceOverview.value) return <CanvasZoomReadout />;
+  const zoom = viewerZoom.value;
+  const auto = zoom === 'auto';
+  const effective = auto ? cssScale.value : zoom;
+  const pct = `${Math.round(effective * 100)}%`;
+  const notch = thumbNotch(effective);
+  return (
+    <div class="flex items-center gap-1 shrink-0">
+      <Slider.Root
+        value={notch}
+        min={-ZOOM_NOTCHES}
+        max={ZOOM_NOTCHES}
+        largeStep={ZOOM_LARGE_STEP}
+        thumbAlignment="edge"
+        // Below lg the bar has no room for it without crushing the URL field; the
+        // readout and ⌘± still zoom there.
+        className="hidden lg:block"
+        onValueChange={(next: number) => {
+          viewerZoom.value = notchToZoom(next);
+        }}
+        // The one place Root's drag state is readable. A tooltip left up mid-drag
+        // would cover the page being resized.
+        render={(props, state) => (
+          <div {...props}>
+            {props.children}
+            <Tooltip text="Zoom" placement="bottom" disabled={state.dragging} />
+          </div>
+        )}
+      >
+        <Slider.Control
+          className="group flex items-center w-24 h-8 touch-none select-none cursor-pointer data-dragging:cursor-grabbing [--thumb:14px]"
+          // Base UI focuses the thumb's input on press, and tinykeys ignores keys aimed
+          // at an input, so a focused slider would swallow tool keys and hand ⌘+ to the
+          // browser's own zoom. Waiting a frame lets Base UI's deferred focus land first.
+          onPointerUp={(e) => {
+            const control = e.currentTarget;
+            requestAnimationFrame(() => {
+              const focused = document.activeElement;
+              if (focused instanceof HTMLElement && control.contains(focused)) focused.blur();
+            });
+          }}
+        >
+          <Slider.Track
+            className={cn(
+              'h-1 w-full rounded-full bg-(--ds-gray-alpha-400) transition-colors duration-150',
+              'group-hover:bg-(--ds-gray-alpha-500) group-data-dragging:bg-(--ds-gray-alpha-500)',
+            )}
+          >
+            <ZoomFill notch={notch} />
+            <Slider.Thumb
+              aria-label="Zoom"
+              aria-valuetext={auto ? `Auto, ${pct}` : pct}
+              className={cn(
+                'size-(--thumb) rounded-full bg-(--ds-background-100) [box-shadow:var(--ds-shadow-border-small)]',
+                'has-focus-visible:outline-solid has-focus-visible:outline-2 has-focus-visible:outline-offset-1',
+                'has-focus-visible:outline-(--ds-focus-color)',
+              )}
+            />
+          </Slider.Track>
+        </Slider.Control>
+      </Slider.Root>
+      <button
+        type="button"
+        onClick={() => {
+          viewerZoom.value = auto ? 1 : 'auto';
+          capture('zoom_reset', { to: auto ? '100' : 'auto' });
+        }}
+        aria-label={auto ? 'Auto, zoom to 100%' : `${pct}, fit to window`}
+        class={cn(geist.ctl, geist.ctlIdle, 'w-11 text-meta font-medium tabular-nums')}
+      >
+        {auto ? 'Auto' : pct}
+        <Tooltip text={auto ? 'Zoom to 100%' : 'Fit to window'} shortcut={auto ? undefined : '⌘0'} placement="bottom" />
+      </button>
+    </div>
+  );
+}
+
+/** The other people in the room. You are not in the stack — you are the
+ *  IdentityCard trigger beside it, which is also where you rename yourself. */
+function PresenceGroup() {
+  if (!peers.value.size) return null;
+  const items = Array.from(peers.value.values()).map((p) => {
+    const agent = isAgentPeer(p.id);
+    const label = agent ? agentLabel(p.name) : p.name;
+    return {
+      key: p.id,
+      name: p.name,
+      color: p.color,
+      glyph: agent ? <AgentMark id={p.name} size={11} /> : undefined,
+      dim: !agent && p.cursor == null,
+      title: agent ? `${label} (connected)` : p.cursor != null ? label : `${label} (inactive)`,
+      onClick: () => {
+        if (!p.cursor) return;
+        capture('peer_followed', { agent });
+        onFollowScroll.value?.(p.cursor.y);
+      },
+    };
+  });
+  return <AvatarGroup items={items} max={MAX_VISIBLE_PEERS} className="mx-1" />;
+}
+
+function JoinVoiceControls() {
+  return (
+    <div class="flex items-center gap-0.5">
+      <BarButton
+        icon={<Mic size={16} strokeWidth={1.5} aria-hidden="true" />}
+        tip="Join voice"
+        onClick={() => {
+          voiceActive.value = true;
+          capture('voice_join_clicked');
+        }}
+      />
+      <Suspense fallback={null}>
+        <DeviceMenu hasPermission={false} />
+      </Suspense>
+    </div>
+  );
+}
+
+function InCallControls() {
+  return (
+    <div class="flex items-center gap-0.5">
+      <BarButton
+        icon={
+          voiceMuted.value ? (
+            <MicOff size={16} strokeWidth={1.5} aria-hidden="true" />
+          ) : (
+            <Mic size={16} strokeWidth={1.5} aria-hidden="true" />
+          )
+        }
+        tip={voiceMuted.value ? 'Unmute' : 'Mute'}
+        on={!voiceMuted.value}
+        onClick={toggleMute}
+      />
+      <BarButton
+        icon={
+          videoActive.value ? (
+            <Video size={16} strokeWidth={1.5} aria-hidden="true" />
+          ) : (
+            <VideoOff size={16} strokeWidth={1.5} aria-hidden="true" />
+          )
+        }
+        tip={videoActive.value ? 'Turn off camera' : 'Turn on camera'}
+        on={videoActive.value}
+        onClick={() => {
+          videoActive.value = !videoActive.value;
+          capture('camera_toggled', { on: videoActive.value });
+        }}
+      />
+      <Suspense fallback={null}>
+        <DeviceMenu hasPermission />
+      </Suspense>
+    </div>
+  );
+}
+
+/**
+ * Previous and next version of a preview room, with the build it shows. Absent
+ * on any room that is not part of a version chain.
+ */
+function VersionSwitcher() {
+  const info = previewInfo.value;
+  if (!info || info.version === null || (!info.previous && !info.next)) return null;
+  const build = [info.branch, info.sha?.slice(0, 7)].filter(Boolean).join(' @ ');
+  const step = (ref: VersionRef, dir: 'prev' | 'next') => {
+    const Icon = dir === 'prev' ? ChevronLeft : ChevronRight;
+    if (!ref) {
+      return (
+        <span aria-hidden="true" class={cn(geist.ctlSm, 'text-(--ds-gray-700)')}>
+          <Icon size={14} strokeWidth={1.5} />
+        </span>
+      );
+    }
+    const label = `${dir === 'prev' ? 'Previous' : 'Next'} version (v${ref.version ?? '?'})`;
+    return (
+      <a
+        href={`/s/${ref.id}`}
+        aria-label={label}
+        onClick={() => capture('version_navigated', { dir })}
+        class={cn(geist.ctlSm, geist.ctlIdle)}
+      >
+        <Icon size={14} strokeWidth={1.5} aria-hidden="true" />
+        <Tooltip text={label} placement="bottom" />
+      </a>
+    );
+  };
+  return (
+    <nav aria-label="Versions" class={cn(geist.track, 'gap-0')}>
+      {step(info.previous, 'prev')}
+      <span class="px-1.5 text-meta font-medium tabular-nums text-(--ds-gray-1000) whitespace-nowrap" title={build}>
+        v{info.version}
+        {build && <span class="max-lg:hidden font-normal text-(--ds-gray-900)"> {build}</span>}
+      </span>
+      {step(info.next, 'next')}
+    </nav>
+  );
+}
+
+function ConnectionStatus() {
+  return <PresenceMenu live={connected.value} count={peerCount.value} />;
+}
+
+/**
+ * "Everyone follow me." Hidden when nobody else is in the room, because pulling
+ * an empty room is a control that does nothing.
+ */
+function PresentButton() {
+  if (!connected.value || peerCount.value < 2) return null;
+  const on = presenting.value;
+  return (
+    <BarButton
+      icon={<MonitorPlay size={16} strokeWidth={1.5} aria-hidden="true" />}
+      tip={on ? 'Stop presenting' : 'Present to everyone'}
+      on={on}
+      onClick={() => {
+        setPresenting(!on);
+        capture('presenting_toggled', { on: !on });
+      }}
+    />
+  );
+}
+
+/**
+ * Paired with the card's own gate — a read-only visitor never renders the dialog,
+ * so they must never get a button that opens nothing.
+ *
+ * Sized, stroked and coloured exactly like every other control in the bar. An
+ * ask for money is the last thing that should be shouting from the chrome; the
+ * tooltip says what it is and the card does the talking.
+ */
+function SupportButton() {
+  return (
+    <BarButton
+      icon={<Heart size={16} strokeWidth={1.5} aria-hidden="true" />}
+      tip="Support MarkLayer"
+      onClick={() => openSupportCard('bar')}
+    />
+  );
+}
+
+/** One lookup rather than two parallel ternaries, so a theme cannot gain an icon without a name. */
+const THEMES = {
+  system: { Icon: MonitorCog, label: 'System' },
+  dark: { Icon: Moon, label: 'Dark' },
+  light: { Icon: Sun, label: 'Light' },
+};
+
+function ThemeButton() {
+  const { Icon, label } = THEMES[theme.value];
+  return (
+    <BarButton
+      icon={<Icon size={16} strokeWidth={1.5} aria-hidden="true" />}
+      tip={`Theme: ${label}`}
+      onClick={() => {
+        cycleTheme();
+        capture('theme_changed', { theme: theme.value });
+      }}
+    />
+  );
+}
+
+export function ViewerTopBar() {
+  return (
+    <div class={cn('flex items-center gap-2 px-3 h-12 z-50 shrink-0', geist.bar)}>
+      <BrandLink />
+      <div class={geist.sep} />
+      <UrlField />
+      <VersionSwitcher />
+      <BarButton
+        icon={<Info size={16} strokeWidth={1.5} aria-hidden="true" />}
+        tip="Details"
+        on={showInfoPanel.value}
+        onClick={() => {
+          showInfoPanel.value = !showInfoPanel.value;
+          capture('panel_toggled', { panel: 'details', open: showInfoPanel.value });
+        }}
+      />
+      <div class={geist.sep} />
+      <ViewportSwitcher />
+      <DeviceOverviewButton />
+      <ZoomControl />
+      <div class={geist.sep} />
+
+      <div class="flex items-center gap-1 shrink-0">
+        <IdentityCard />
+        <PresenceGroup />
+        {voiceActive.value ? <InCallControls /> : <JoinVoiceControls />}
+        <ConnectionStatus />
+        <PresentButton />
+        <BarButton
+          icon={<MessageSquare size={16} strokeWidth={1.5} aria-hidden="true" />}
+          tip="Annotations panel"
+          on={showAnnotationPanel.value}
+          onClick={() => {
+            showAnnotationPanel.value = !showAnnotationPanel.value;
+            capture('panel_toggled', { panel: 'annotations', open: showAnnotationPanel.value });
+          }}
+        />
+        {!isReadonly.value && <SharePopover />}
+        {!isReadonly.value && <SupportButton />}
+        <ThemeButton />
+      </div>
+    </div>
+  );
+}

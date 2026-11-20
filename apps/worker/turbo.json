@@ -1,0 +1,25 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "extends": ["//"],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["public/**"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/apps/extension/components/**",
+        "$TURBO_ROOT$/apps/extension/lib/**",
+        "$TURBO_ROOT$/apps/extension/widget/**",
+        "$TURBO_ROOT$/apps/extension/entrypoints/content/style.css"
+      ]
+    },
+    "check": {
+      "dependsOn": ["^build"],
+      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/apps/extension/components/**", "$TURBO_ROOT$/apps/extension/lib/**"]
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/apps/extension/components/**", "$TURBO_ROOT$/apps/extension/lib/**"]
+    }
+  }
+}
